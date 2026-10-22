@@ -10,8 +10,10 @@ unplugged during normal operation; this node is the only thing on the bus.
 |---|---|
 | `ac-a5-control-c6.yaml` | Full ESPHome config (entities, decoder, climate) |
 | `aciq_tx.h` | A5 frame builder + CRC16 (byte-identical to ACiQ's), `!include`d by the yaml |
-| `secrets.yaml` | WiFi creds / per-node secrets. **Local-only: do not add a public remote.** |
 | `docs/` | Wiring + bus-takeover state docs |
+
+Secrets are **not** in this repo: they are managed and shared from the ESPHome
+dashboard (device-builder), which provisions `secrets.yaml` on pod `/config`.
 
 ## Where these files must live to be buildable
 
@@ -28,7 +30,8 @@ Sync this repo to the pod (run from a box with the cluster kubeconfig):
     P=$(kubectl -n esphome get pods -l app.kubernetes.io/name=esphome -o jsonpath='{.items[0].metadata.name}')
     kubectl -n esphome cp ac-a5-control-c6.yaml $P:/config/
     kubectl -n esphome cp aciq_tx.h            $P:/config/
-    kubectl -n esphome cp secrets.yaml         $P:/config/
+
+(`secrets.yaml` is already on the pod, dashboard-managed.)
 
 The pod's `/config` has its own git; commit there after syncing.
 
