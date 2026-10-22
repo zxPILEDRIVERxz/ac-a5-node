@@ -7,3 +7,6 @@ packages:
     username: zxPILEDRIVERxz
     password: !secret ac_a5_listen__github_token
     files: [ac-a5-control-c6.yaml]
+    # Default package cache is 1 day -- that would let a push build with
+    # yesterday's config. Always re-fetch so every build is the repo HEAD.
+    refresh: always
