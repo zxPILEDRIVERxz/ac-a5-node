@@ -1099,7 +1099,7 @@ climate:
     sensor: room_temp_c
     supports_action: true
     supported_modes:
-      - OFF
+      - "OFF"
       - HEAT_COOL   # the unit's "auto"
       - COOL
       - DRY
@@ -1116,7 +1116,7 @@ climate:
         target_temperature: 1.0
         current_temperature: 0.5
     initial_state:
-      mode: OFF
+      mode: "OFF"
       fan_mode: AUTO
 
     # Mode. `x` is the requested ClimateMode; OFF sends the power-off frame.
