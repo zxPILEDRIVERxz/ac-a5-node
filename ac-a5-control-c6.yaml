@@ -107,19 +107,10 @@ esphome:
   includes:
     - aciq_tx.h
 
-# CLIMATE PLATFORM: ACiQ's verified external component (MIT, codypendant/
-# aciq-minisplit-protocol, esphome/components/aciq_k18w/), ported byte-for-byte
-# into components/ next to this file. Their K18W and this unit speak the same
-# A5 field map (0x01/0x02/0x05/0x12/0x13/0x73), so the component is used as-is;
-# only the YAML wiring below is adapted to this config's ids. It owns no UART:
-# state is pushed in from the decoder, control comes back out as triggers that
-# build frames with aciq_tx.h and send through tx_send -- same interlock, same
-# single wire path as every other command here.
-external_components:
-  - source:
-      type: local
-      path: components
-    components: [aciq_k18w]
+# CLIMATE PLATFORM: built-in Template Climate (esphome >= 2026.9) -- no custom
+# component needed. It owns no UART: the decoder above pushes state into it,
+# and its set_*_actions build frames with aciq_tx.h and send them through
+# tx_send -- same interlock, same single wire path as every other command here.
 
 esp32:
   board: seeed_xiao_esp32c6
@@ -355,6 +346,16 @@ sensor:
     accuracy_decimals: 1
     device_class: temperature
 
+  # Celsius mirror of the above -- the climate API is C-only, and the climate
+  # entity's current temp rides this one. Internal: HA/Lucia read the °F one.
+  - platform: template
+    name: "Room Temp (C)"
+    id: room_temp_c
+    unit_of_measurement: "\u00B0C"
+    accuracy_decimals: 1
+    device_class: temperature
+    internal: true
+
   - platform: template
     name: "Setpoint (C field)"
     id: setpoint_c
@@ -577,7 +578,7 @@ interval:
                     case 0x03:  // room temperature, centi-degrees C
                       if (val >= 500 && val <= 5000) {
                         id(room_temp_f).publish_state(val / 100.0f * 9.0f / 5.0f + 32.0f);
-                        id(ac_climate).set_room_temperature_f(val / 100.0f * 9.0f / 5.0f + 32.0f);
+                        id(room_temp_c).publish_state(val / 100.0f);   // climate's current temp (C-only API)
                       }
                       break;
                     case 0x60:  // outdoor temperature, centi-degrees C
@@ -586,7 +587,24 @@ interval:
                     case 0x65:  // actual compressor speed, percent
                       if (val <= 100) {
                         id(compressor_actual_pct).publish_state((float) val);
-                        id(ac_climate).set_compressor_running(val > 0);
+                        // Action: the compressor flag is the honest signal -- what is
+                        // happening, not what was asked for. (Same mapping as the old
+                        // component's republish_.)
+                        if (!id(power).has_state() || !id(power).state) {
+                          id(ac_climate).action = climate::CLIMATE_ACTION_OFF;
+                        } else if (val > 0) {
+                          switch (id(ac_climate).mode) {
+                            case climate::CLIMATE_MODE_HEAT:     id(ac_climate).action = climate::CLIMATE_ACTION_HEATING; break;
+                            case climate::CLIMATE_MODE_DRY:      id(ac_climate).action = climate::CLIMATE_ACTION_DRYING;  break;
+                            case climate::CLIMATE_MODE_FAN_ONLY: id(ac_climate).action = climate::CLIMATE_ACTION_FAN;     break;
+                            default:                             id(ac_climate).action = climate::CLIMATE_ACTION_COOLING; break;
+                          }
+                        } else if (id(ac_climate).mode == climate::CLIMATE_MODE_FAN_ONLY) {
+                          id(ac_climate).action = climate::CLIMATE_ACTION_FAN;
+                        } else {
+                          id(ac_climate).action = climate::CLIMATE_ACTION_IDLE;
+                        }
+                        id(ac_climate).publish_state();
                       }
                       break;
                     case 0xC0:  // commanded compressor target, percent
@@ -651,12 +669,27 @@ interval:
                   case 0x01:   // power -- toggled exactly in step with power presses
                     id(power).publish_state(val != 0);
                     id(ac_power_sw).publish_state(val != 0);   // keep the command switch honest
-                    id(ac_climate).set_power_state(val != 0);
+                    if (val == 0) {
+                      // Power off wins over whatever mode the unit last reported -- the AC
+                      // keeps reporting `cool` while switched off.
+                      id(ac_climate).set_mode(climate::CLIMATE_MODE_OFF);
+                      id(ac_climate).action = climate::CLIMATE_ACTION_OFF;
+                    }
+                    id(ac_climate).publish_state();
                     break;
                   case 0x05:   // fan speed, 7 steps + auto
                     if (val <= 15) {
                       id(fan_speed).publish_state((float) val);
-                      id(ac_climate).set_fan_state((int) val, val == 0);
+                      if (val == 0) {
+                        id(ac_climate).set_fan_mode(climate::CLIMATE_FAN_AUTO);
+                      } else if (val == 1) {
+                        id(ac_climate).set_custom_fan_mode("mute");
+                      } else {
+                        char b[8];
+                        snprintf(b, sizeof b, "%u", (unsigned) val);
+                        id(ac_climate).set_custom_fan_mode(b);
+                      }
+                      id(ac_climate).publish_state();
                     }
                     break;
                   case 0x12: { // mode: 0 auto 1 cool 2 dry 3 fan 4 heat
@@ -664,7 +697,13 @@ interval:
                       static const char *const NAMES[5] = {"auto", "cool", "dry", "fan", "heat"};
                       id(mode_name).publish_state(NAMES[val]);
                       id(ac_mode_sel).publish_state(std::string(NAMES[val]));
-                      id(ac_climate).set_mode_raw((int) val);
+                      // The unit's "auto" is the HA-facing heat/cool mode.
+                      static const climate::ClimateMode MAP[5] = {
+                          climate::CLIMATE_MODE_HEAT_COOL, climate::CLIMATE_MODE_COOL,
+                          climate::CLIMATE_MODE_DRY,       climate::CLIMATE_MODE_FAN_ONLY,
+                          climate::CLIMATE_MODE_HEAT};
+                      id(ac_climate).set_mode(MAP[val]);
+                      id(ac_climate).publish_state();
                     }
                     break;
                   }
@@ -678,7 +717,19 @@ interval:
                                // manual speed is flag 0 + the speed. Feed climate
                                // with the speed the node currently knows (the
                                // report may carry 05 before or after 73).
-                    id(ac_climate).set_fan_state(id(fan_speed).has_state() ? (int) id(fan_speed).state : 0, val != 0);
+                    {
+                      int sp = id(fan_speed).has_state() ? (int) id(fan_speed).state : 0;
+                      if (val != 0 || sp <= 0) {
+                        id(ac_climate).set_fan_mode(climate::CLIMATE_FAN_AUTO);
+                      } else if (sp == 1) {
+                        id(ac_climate).set_custom_fan_mode("mute");
+                      } else {
+                        char b[8];
+                        snprintf(b, sizeof b, "%d", sp);
+                        id(ac_climate).set_custom_fan_mode(b);
+                      }
+                      id(ac_climate).publish_state();
+                    }
                     break;
                   case 0x1E:   // Display Light -- the indoor unit's LED display.
                                // K18W capture confirmed the app toggle 1E=00 then
@@ -703,7 +754,8 @@ interval:
                 if (sp >= 55 && sp <= 95) {
                   id(setpoint_f).publish_state((float) sp);
                   id(ac_set_sp).publish_state((float) sp);      // track the unit, don't lie about it
-                  id(ac_climate).set_setpoint_f((float) sp);
+                  id(ac_climate).target_temperature = (sp - 32.0f) * 5.0f / 9.0f;  // C-only API
+                  id(ac_climate).publish_state();
                 }
               }
 
@@ -1019,34 +1071,68 @@ switch:
         id(tx_send)->execute(c.build());
 
 # =============================================================================
-# CLIMATE ENTITY (ACiQ's verified external component -- see components/ above)
+# CLIMATE ENTITY (built-in Template Climate, esphome >= 2026.9)
 #
 # The HA-facing surface. It owns NO uart: state is pushed in from the decoder
-# above via set_*(), and control requests come back out as triggers so the
-# frame is still built with aciq_tx.h and sent through `tx_send` -- the same
-# TX-Armed interlock and single wire path as every other command. A climate
-# component with its own private route to the wire would bypass both.
+# above (set_mode / set_fan_mode / set_custom_fan_mode / target_temperature /
+# action + publish_state), and control requests come back out as set_*_actions
+# so the frame is still built with aciq_tx.h and sent through `tx_send` -- the
+# same TX-Armed interlock and single wire path as every other command. A
+# climate platform with its own private route to the wire would bypass both.
 #
-# Nothing here publishes optimistic state. The AC reports what it actually did
-# a moment later, and that report is the authority -- so a setpoint the
-# mainboard range-checks out simply does not stick, exactly like the raw
-# entities already behave.
+# optimistic: false -- nothing here publishes on a command. The AC reports what
+# it actually did a moment later, and that report is the authority -- so a
+# setpoint the mainboard range-checks out simply does not stick, exactly like
+# the raw entities already behave.
 #
 # UNITS: the ESPHome climate API is Celsius-only (HA converts for display).
-# control() rounds the requested value to a whole degF -- the unit's ladder and
-# its own display are built on degF (59..89 here, from the unit's own
-# 0x21/0x22 = 1600..3100 centi-C) -- so the card offers 1-degree steps in
+# set_target_temperature_action rounds the request to a whole degF -- the unit's
+# ladder and its own display are built on degF (59..89 here, from the unit's
+# own 0x21/0x22 = 1600..3100 centi-C). The card offers 1-degree steps in
 # whatever display unit HA is set to.
 # =============================================================================
 climate:
-  - platform: aciq_k18w
+  - platform: template
     id: ac_climate
     name: "Mini-Split"
+    # Current temp rides the decoder's room-temp report, converted at the feed.
+    sensor: room_temp_c
+    supports_action: true
+    supported_modes:
+      - OFF
+      - HEAT_COOL   # the unit's "auto"
+      - COOL
+      - DRY
+      - FAN_ONLY
+      - HEAT
+    supported_fan_modes:
+      - AUTO
+    custom_fan_modes: [mute, "2", "3", "4", "5", "6", "7"]
+    optimistic: false
+    visual:
+      min_temperature: 16.0
+      max_temperature: 31.0
+      temperature_step:
+        target_temperature: 1.0
+        current_temperature: 0.5
+    initial_state:
+      mode: OFF
+      fan_mode: AUTO
 
-    # Mode. `x` is the raw protocol value, or -1 for power off.
-    on_set_mode:
+    # Mode. `x` is the requested ClimateMode; OFF sends the power-off frame.
+    set_mode_action:
       - lambda: |-
-          if (x < 0) {
+          int raw = -1;
+          switch ((int) x) {
+            case (int) climate::CLIMATE_MODE_OFF:         raw = -1; break;
+            case (int) climate::CLIMATE_MODE_HEAT_COOL:   raw = 0;  break;
+            case (int) climate::CLIMATE_MODE_COOL:        raw = 1;  break;
+            case (int) climate::CLIMATE_MODE_DRY:         raw = 2;  break;
+            case (int) climate::CLIMATE_MODE_FAN_ONLY:    raw = 3;  break;
+            case (int) climate::CLIMATE_MODE_HEAT:        raw = 4;  break;
+            default: return;
+          }
+          if (raw < 0) {
             auto off = aciq::Command(id(g_tx_seq)++);
             off.field(0x01, 0x00);
             id(tx_send)->execute(off.build());
@@ -1058,13 +1144,13 @@ climate:
           // absolute -- setting it on an already-on unit is a no-op. Also
           // covers power being unknown right after a node reboot.
           if (!id(power).has_state() || !id(power).state) c.field(0x01, 0x01);
-          c.field(0x12, (uint8_t) x);
+          c.field(0x12, (uint8_t) raw);
           id(tx_send)->execute(c.build());
 
-    # Setpoint. `x` is Fahrenheit, already rounded whole in control().
-    on_set_temperature:
+    # Setpoint. `x` is Celsius; round onto the unit's whole-degF ladder.
+    set_target_temperature_action:
       - lambda: |-
-          int f = (int) lroundf(x);
+          int f = (int) lroundf(x * 9.0f / 5.0f + 32.0f);
           if (f < 59) f = 59;
           if (f > 89) f = 89;
           // Both records, as the app sends: centi-Celsius value + degF label.
@@ -1073,14 +1159,25 @@ climate:
           c.wide(0x02, aciq::centi_c_for_degf(f)).param(0x27, (uint8_t) f);
           id(tx_send)->execute(c.build());
 
-    # Fan. `x` is 0 for auto, 1 for mute, 2..7 for the manual speeds.
-    on_set_fan:
+    # Fan (built-in enum). Only AUTO is offered here; mute and the manual
+    # speeds are custom fan modes below. 0x73 is the AUTO FLAG: auto is
+    # flag=1 with speed 0.
+    set_fan_mode_action:
       - lambda: |-
-          uint8_t speed = (uint8_t) x, autoflag = 0;
-          if (x <= 0) { autoflag = 1; speed = 0; }
-          // 0x73 is the AUTO FLAG, not a speed. Auto is flag=1 with speed 0.
           auto c = aciq::Command(id(g_tx_seq)++);
-          c.field(0x73, autoflag).field(0x05, speed);
+          c.field(0x73, 1).field(0x05, 0);
+          id(tx_send)->execute(c.build());
+
+    # Fan (custom names): mute + manual speeds 2..7 -> flag=0 + the speed.
+    set_custom_fan_mode_action:
+      - lambda: |-
+          uint8_t speed = 1;                      // "mute" (also the fallback)
+          if (strcmp(x.c_str(), "mute") != 0) {
+            int v = atoi(x.c_str());
+            if (v >= 2 && v <= 7) speed = (uint8_t) v;
+          }
+          auto c = aciq::Command(id(g_tx_seq)++);
+          c.field(0x73, 0).field(0x05, speed);
           id(tx_send)->execute(c.build());
 
 button:

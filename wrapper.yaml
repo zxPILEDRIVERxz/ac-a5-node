@@ -1,0 +1,9 @@
+# Thin wrapper -- the real config is pulled from GitHub at build time, so
+# every push (dashboard or HA app) always builds the current repo config.
+# Do not edit here: edit ac-a5-control-c6.yaml in zxPILEDRIVERxz/ac-a5-node.
+packages:
+  ac_node:
+    url: https://github.com/zxPILEDRIVERxz/ac-a5-node
+    username: zxPILEDRIVERxz
+    password: !secret ac_a5_listen__github_token
+    files: [ac-a5-control-c6.yaml]
