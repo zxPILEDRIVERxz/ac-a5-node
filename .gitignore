@@ -1,0 +1,9 @@
+# ESPHome build/storage artifacts (if a build ever runs inside this checkout)
+.esphome/
+__pycache__/
+*.o
+*.elf
+*.bin
+partition-table.bin
+bootloader.bin
+secrets.yaml

@@ -1,0 +1,1090 @@
+# =============================================================================
+# AC BUS CONTROL -- XIAO ESP32C6 (Seed Studio)   (session 2: RX + TX / takeover)
+# Project: mini-split local control. Full context: ac-uart-takeover.md
+# WIRING SCHEMATIC: ac-a5-listen-wiring.md (net list, solder order, power rules)
+#
+# Purpose : drive the bus the way the Tuya module did -- acknowledge every
+#           report, answer clock requests, and send commands (setpoint/mode/
+#           fan/power/eco) -- so the mainboard stops retrying and the link is
+#           ours. Built on the session-1 listener: identical decoder, now with
+#           a tx_pin and ACiQ-verified command frames (session 2b).
+#
+# *** SAFETY MODEL (read before arming TX) ***
+#   * "TX Armed" (switch in HA) defaults OFF and does not restore. A fresh
+#     flash behaves EXACTLY like the session-1 listener until you arm it, so
+#     first flash is zero-risk even if Tuya happens to be plugged in.
+#   * Arm TX only with Tuya UNPLUGGED -- our node REPLACES it; two modules
+#     driving one wire at once is push-pull contention. Keep TX disarmed and
+#     plug Tuya in ONLY to capture `Last Command` frames passively.
+#   * Armed, the node drives the bus three ways: ACK every verified report
+#     (0x23 echo), answer clock requests (ACiQ-verified 0x23 answer), and send
+#     commands built with aciq_tx.h -- setpoint, mode, fan, power, eco. A
+#     command NEVER transmits by itself: each frame is one deliberate HA
+#     action on a control entity, in the exact shapes ACiQ captured from the
+#     real dongle (PROTOCOL.md "Commands"; re-verified byte-for-byte here).
+#   * Every failure mode degrades to "mainboard ignores our frame" -> status quo.
+#
+# *** WIRING IN ONE PARAGRAPH (details + ASCII diagram: ac-a5-listen-wiring.md)
+#   FINAL WIRE MAP (2026-10-20, metered by hand -- the USB breakout's PIN
+#   LABELS DO NOT MATCH THE CABLE. Trust this table, not the silkscreen;
+#   RX/TX pin assignment flipped 2026-10-21 after the first D5/D4 flash):
+#     black wire = +5V      -> shifter VCC_B            (+ XIAO 5V pin = PERMANENT
+#                                                             INSTALL ONLY: jumper
+#                                                             closed only AFTER the
+#                                                             USB-C cable is out --
+#                                                             never both at once)
+#     white wire = GND      -> shifter GND_A + GND_B + XIAO GND
+#     green wire = mainboard->module data -> shifter B1 -> A1 -> XIAO D4 (RX, GPIO22)
+#     red wire   = module->mainboard data (OUR TX TARGET) -> B2 -> A2 -> XIAO D5 (TX, GPIO23)
+#     XIAO 3V3   -> shifter VCC_A
+#   History: the first build put white (true GND) on B2 while the "ground" net
+#   sat at +5 V -- i.e. -5 V out-of-spec on the shifter's B side (the earlier
+#   "white = 5 V" reading was actually -5 V). It still decoded because the XIAO
+#   had floated +5 V above AC ground, but it was never correct. Reconnected per
+#   this map 2026-10-20; arming TX then produced ACKs Sent climbing in HA.
+# POWER PLAN: test period = USB-C wall adapter only. Permanent install =
+#   harness VBUS on the 5V pin (a designed input per Seeed's pin map: "VBUS -
+#   Power Input/Output"), USB cable removed forever, all later updates OTA.
+#   Back-feeding two 5V sources at once destroys boards -- unplug USB before
+#   closing net 6. The C6's GPIOs are not 5V tolerant, which is exactly what
+#   the shifter handles (bus expected ~5V per ACiQ's measurement of identical
+#   hardware; a 3.3V bus also works through the same wiring).
+#
+# FLASHING:
+#   XIAO ESP32C6 has NATIVE USB on the USB-C port (no bridge chip);
+#   ESPHome/esptool flashes it directly. You need a DATA usb-c cable (many
+#   cheap cables are charge-only -- if nothing happens, try another cable).
+#   Home Assistant -> ESPHome add-on -> Add New Device -> connect the XIAO
+#   over USB -> fill in the WiFi below -> Flash.
+#   If the board is not detected: hold its BOOT button while plugging USB in,
+#   release after ~2 s. (The other button is reset.)
+#   After it joins WiFi, every entity and the log appear in Home Assistant.
+#   This is the ONE-TIME cable connection: after this flash, all updates are
+#   OTA over WiFi; after the test period the USB cable is removed entirely
+#   (permanent power = harness VBUS on the 5V pin -- see wiring doc).
+#
+# READING THE RESULT (all entities are in HA; wait ~5 min with the AC powered):
+#   RX Bytes            ticks as soon as ANY traffic exists on the tapped line.
+#                       Flat while the AC is powered = wrong wire / no common
+#                       GND / shifter miswired. The mainboard transmits on its
+#                       own even with the Tuya module unplugged (ACiQ verified:
+#                       "AC powered alone, no module -> RED active").
+#   Frames              A5 frames accepted with a VERIFIED checksum.
+#   CRC ACiQ-hole OK    variant 1: XMODEM over the whole frame minus bytes 8-9
+#                       (the variant ACiQ verified on 105 frames of sibling hw)
+#   CRC Zokop-prefix OK variant 2: XMODEM over header bytes 0-7 only
+#   (One of the two counters should dominate; that is your unit's variant.
+#    If BOTH "CRC Bad" and raw bytes rise, framing/baud is off -- try 9600.)
+#   Rejected            implausible length bytes (noise, not real frames)
+#   Last Frame          hex of the newest verified frame = mapping material
+#   Last Command        decoded 0A 0A command records (appears when a module
+#                       is on the bus and someone sends commands -- with Tuya
+#                       plugged in you can generate them from the app!)
+#   Commands Sent       our command frames (setpoint/mode/fan/power/eco).
+#                       Moves only when you touch a control entity.
+#   Commands ACKed      mainboard 0x23 frames carrying payload header 80 0A =
+#                       it accepted one of OUR commands. The closed-loop proof:
+#                       change Set Setpoint, watch this tick, then watch the
+#                       Setpoint (C field) / Setpoint (F param) sensors move to
+#                       the new value in the next report (~17 s).
+#   Unmapped Fields     fields not yet named = your mapping queue. When it
+#                       reads "all-mapped" every field in the frame is known.
+#   Power / Mode / ...  publish as soon as those known fields appear, so you
+#                       can confirm the map live by pressing the IR remote.
+#
+# WATCHDOG: 2 min of byte-silence (with the AC powered) reboots the node, up
+# to 3 times, then gives up and logs why. Silence is abnormal on a live bus --
+# but if it trips 3x with Tuya unplugged, the bus may only talk WITH a module
+# attached; plug the Tuya back in (safe while TX Armed is OFF: no transmitting)
+# and retest.
+# =============================================================================
+
+esphome:
+  name: ac-a5-listen          # name unchanged on purpose: OTA from the existing HA device entry
+  friendly_name: "AC Bus Control (XIAO C6)"
+  # Session 2b frame construction (CRC, length, records). Header-only, next to
+  # this file. Verified against real-dongle captures in PROTOCOL.md.
+  includes:
+    - aciq_tx.h
+
+# CLIMATE PLATFORM: ACiQ's verified external component (MIT, codypendant/
+# aciq-minisplit-protocol, esphome/components/aciq_k18w/), ported byte-for-byte
+# into components/ next to this file. Their K18W and this unit speak the same
+# A5 field map (0x01/0x02/0x05/0x12/0x13/0x73), so the component is used as-is;
+# only the YAML wiring below is adapted to this config's ids. It owns no UART:
+# state is pushed in from the decoder, control comes back out as triggers that
+# build frames with aciq_tx.h and send through tx_send -- same interlock, same
+# single wire path as every other command here.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [aciq_k18w]
+
+esp32:
+  board: seeed_xiao_esp32c6
+
+logger:
+  level: INFO
+  # NOTE: never log per-frame. ACiQ's node went deaf in 5-38 min with
+  # ESP_LOGI on every frame and ran 9.4 h clean after removing it. This build
+  # has zero per-frame logging; the Last Frame entity carries the same hex.
+
+api:
+
+ota:
+  - platform: esphome
+
+# Lets the build server + HA discover the node by name (ac-a5-listen.local)
+# for OTA, instead of hunting its IP. Safe/standard; no cloud involvement.
+mdns:
+
+wifi:
+  ssid: ChewysHouse
+  password: !secret wifi_password
+  ap:
+    ssid: "ac-a5-listen fallback"
+    password: "changeme1234"
+
+captive_portal:
+
+time:
+  - platform: sntp
+    id: ac_time            # NTP clock; used only to answer the mainboard's clock
+                           # requests. If NTP never syncs, the node simply does not
+                           # answer clocks (guarded in the TX code) -- harmless.
+
+uart:
+  id: ac_bus
+  rx_pin: D4               # GPIO22, plain GPIO (I2C-SDA by default) -- moved off D7/GPIO17
+                           # (UART0 console RX) for the permanent install so D6/D7 are free.
+                           # Shifter path unchanged: green wire -> B1 -> A1 (VERIFIED this unit's
+                           # traffic is on that side). Flipped from D5 2026-10-21: first build had
+                           # RX/TX backwards, node was deaf.
+  tx_pin: D5               # GPIO23, plain GPIO (I2C-SCL by default) -- moved off D6/GPIO16
+                           # (UART0 console TX) for the permanent install. Shifter path unchanged:
+                           # red wire (module->mainboard data) -> B2 -> A2.
+                           # Driven only while "TX Armed" is ON. If "ACKs Sent" climbs but the
+                           # bus does not calm down, we are on the wrong data wire -- swap it.
+  baud_rate: 115200        # ACiQ measured 115200 empirically (2347/2347 pulses).
+                           # If raw bytes rise but frames never do, try 9600.
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 1024     # proven value from ACiQ; the buffer was never their problem
+
+globals:
+  - id: rx_buf
+    type: uint8_t[300]
+    restore_value: no
+  - id: rx_len
+    type: uint8_t
+    restore_value: no
+  - id: g_rx_bytes
+    type: uint32_t
+    initial_value: "0"
+    restore_value: no
+  - id: g_frames
+    type: uint32_t
+    initial_value: "0"
+    restore_value: no
+  - id: g_rejects
+    type: uint32_t
+    initial_value: "0"
+    restore_value: no
+  - id: g_crc_aciq
+    type: uint32_t
+    initial_value: "0"
+    restore_value: no
+  - id: g_crc_zokop
+    type: uint32_t
+    initial_value: "0"
+    restore_value: no
+  - id: g_crc_bad
+    type: uint32_t
+    initial_value: "0"
+    restore_value: no
+  - id: last_byte_ms
+    type: uint32_t
+    initial_value: "0"
+    restore_value: no
+  - id: last_frame_ms
+    type: uint32_t
+    initial_value: "0"
+    restore_value: no
+  - id: wd_reboots
+    type: uint8_t
+    initial_value: "0"
+    restore_value: no
+  # ---- session 2 TX state ----
+  - id: g_tx_armed
+    type: bool
+    initial_value: "false"     # OFF by default: pure listener until armed (see switch below)
+    restore_value: no
+  - id: g_ack_enabled
+    type: bool
+    initial_value: "true"      # ACK every verified report (0x23 echo)
+    restore_value: no
+  - id: g_clock_enabled
+    type: bool
+    initial_value: "true"      # answer clock requests (0D 0D + NTP unix time)
+    restore_value: no
+  - id: g_acks_sent
+    type: uint32_t
+    initial_value: "0"
+    restore_value: no
+  - id: g_clocks_sent
+    type: uint32_t
+    initial_value: "0"
+    restore_value: no
+  # ---- session 2b command state ----
+  - id: g_tx_seq
+    type: uint8_t
+    initial_value: "0"       # module-side counter, byte [4] of every command frame
+    restore_value: no
+  - id: g_cmds_sent
+    type: uint32_t
+    initial_value: "0"
+    restore_value: no
+  - id: g_cmd_acks
+    type: uint32_t
+    initial_value: "0"       # mainboard ACKs (0x23 with payload header 80 0A)
+                             # to OUR commands -- the closed-loop acceptance proof
+    restore_value: no
+
+sensor:
+  # ---- raw counters, polled every 30 s (not per-byte) ----
+  - platform: template
+    name: "RX Bytes"
+    id: rx_bytes
+    unit_of_measurement: "B"
+    state_class: total_increasing
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'return (float) id(g_rx_bytes);'
+
+  - platform: template
+    name: "Frames"
+    id: frames
+    state_class: total_increasing
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'return (float) id(g_frames);'
+
+  - platform: template
+    name: "Rejected (bad length)"
+    id: rejects
+    state_class: total_increasing
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'return (float) id(g_rejects);'
+
+  - platform: template
+    name: "CRC ACiQ-hole OK"
+    id: crc_aciq
+    state_class: total_increasing
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'return (float) id(g_crc_aciq);'
+
+  - platform: template
+    name: "CRC Zokop-prefix OK"
+    id: crc_zokop
+    state_class: total_increasing
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'return (float) id(g_crc_zokop);'
+
+  - platform: template
+    name: "CRC Bad (both)"
+    id: crc_bad
+    state_class: total_increasing
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'return (float) id(g_crc_bad);'
+
+  - platform: template
+    name: "ACKs Sent"
+    id: acks_sent
+    state_class: total_increasing
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'return (float) id(g_acks_sent);'
+
+  - platform: template
+    name: "Clocks Sent"
+    id: clocks_sent
+    state_class: total_increasing
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'return (float) id(g_clocks_sent);'
+
+  - platform: template
+    name: "Commands Sent"
+    id: cmds_sent
+    state_class: total_increasing
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'return (float) id(g_cmds_sent);'
+
+  - platform: template
+    name: "Commands ACKed"
+    id: cmd_acks
+    state_class: total_increasing
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'return (float) id(g_cmd_acks);'
+
+  # ---- decoded fields, pushed from the decode loop ----
+  # (field map ported from ACiQ's verified decoder; this unit's firmware is a
+  #  different build -- confirm each one live by pressing the IR remote)
+  - platform: template
+    name: "Room Temp"
+    id: room_temp_f
+    unit_of_measurement: "\u00B0F"
+    accuracy_decimals: 1
+    device_class: temperature
+
+  - platform: template
+    name: "Setpoint (C field)"
+    id: setpoint_c
+    unit_of_measurement: "\u00B0C"
+    accuracy_decimals: 1
+    device_class: temperature
+
+  - platform: template
+    name: "Setpoint (F param)"
+    id: setpoint_f
+    unit_of_measurement: "\u00B0F"
+    accuracy_decimals: 0
+    device_class: temperature
+
+  - platform: template
+    name: "Outdoor Temp"
+    id: outdoor_temp_f
+    unit_of_measurement: "\u00B0F"
+    accuracy_decimals: 1
+    device_class: temperature
+
+  - platform: template
+    name: "Compressor Target"
+    id: compressor_target_pct
+    unit_of_measurement: "%"
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Compressor Actual"
+    id: compressor_actual_pct
+    unit_of_measurement: "%"
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Input Power"
+    id: input_power_w
+    unit_of_measurement: "W"
+    device_class: power
+
+  - platform: template
+    name: "Fan Percent"
+    id: fan_pct
+    unit_of_measurement: "%"
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Fan Speed (steps)"
+    id: fan_speed
+    accuracy_decimals: 0
+    entity_category: diagnostic
+
+binary_sensor:
+  - platform: template
+    name: "Power"
+    id: power
+    device_class: running
+
+text_sensor:
+  - platform: template
+    name: "Mode"
+    id: mode_name
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Last Frame"
+    id: last_frame
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Last Command"
+    id: last_command
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Unmapped Fields"
+    id: unmapped_fields
+    entity_category: diagnostic
+
+interval:
+  # ---- the decoder: runs every 10 ms, drains the UART, frames, checksums,
+  #      and decodes. Ported from ACiQ's proven 9.4-hour-stable config: same
+  #      state machine, same record walk, same wide/namespace/list handling --
+  #      with a SECOND CRC variant counted in parallel, because this unit is a
+  #      different firmware build and the capture decides which one it uses.
+  - interval: 10ms
+    then:
+      - lambda: |-
+          auto &v = id(rx_buf);
+          uint8_t &n = id(rx_len);
+          static std::string prev_frame, prev_cmd, prev_unmapped;
+
+          int avail = id(ac_bus).available();
+          for (int i = 0; i < avail; i++) {
+            uint8_t b;
+            id(ac_bus).read_byte(&b);   // current ESPHome UART API (old int-returning read() is gone)
+            id(g_rx_bytes)++;
+            id(last_byte_ms) = millis();
+
+            // Resynchronise on the header rather than trusting alignment.
+            if (n == 0 && b != 0xA5) continue;
+            v[n++] = b;
+
+            // Length arrives at index 7. Reject implausible values immediately
+            // so a corrupt byte costs one frame, not the whole stream.
+            if (n == 8 && (v[7] < 8 || v[7] > 128)) { id(g_rejects)++; n = 0; continue; }
+            if (n < 8 || n != v[7]) continue;
+
+            // ---- CHECKSUM: CRC-16/XMODEM (poly 0x1021, init 0, MSB-first),
+            //      BOTH documented variants in one pass:
+            //        hole  = whole frame with bytes 8-9 REMOVED (not zeroed)
+            //        pfx   = header bytes 0-7 only
+            uint16_t cHole = 0x0000, cPfx = 0x0000;
+            for (int k = 0; k < (int) n; k++) {
+              if (!(k == 8 || k == 9)) {
+                cHole ^= (uint16_t) v[k] << 8;
+                for (int j = 0; j < 8; j++)
+                  cHole = (cHole & 0x8000) ? (uint16_t)((cHole << 1) ^ 0x1021) : (uint16_t)(cHole << 1);
+              }
+              if (k < 8) {
+                cPfx ^= (uint16_t) v[k] << 8;
+                for (int j = 0; j < 8; j++)
+                  cPfx = (cPfx & 0x8000) ? (uint16_t)((cPfx << 1) ^ 0x1021) : (uint16_t)(cPfx << 1);
+              }
+            }
+            uint16_t want = ((uint16_t) v[8] << 8) | v[9];
+            if (cHole != want && cPfx != want) { id(g_crc_bad)++; n = 0; continue; }
+            if (cHole == want) id(g_crc_aciq)++; else id(g_crc_zokop)++;
+
+            // ---- complete, verified frame ----
+            id(g_frames)++;
+            id(last_frame_ms) = millis();
+
+            std::string hex; char tmp[4];
+            for (int k = 0; k < (int) n; k++) { sprintf(tmp, "%02X ", v[k]); hex += tmp; }
+            if (!hex.empty()) hex.pop_back();
+            if (hex != prev_frame) {
+              prev_frame = hex;
+              id(last_frame).publish_state(hex.size() > 255 ? hex.substr(0, 245) + " ..." : hex);
+            }
+
+            // ---- classify the frame ----
+            bool mapped = false;
+
+            // ACKs carry no state -- they only echo the counter. A 0x23 whose
+            // payload header is 80 0A is the mainboard acknowledging one of OUR
+            // commands (session 2b) -- count it as the acceptance proof.
+            if (v[3] == 0x23) {
+              if (n >= 12 && v[10] == 0x80 && v[11] == 0x0A) id(g_cmd_acks)++;
+              mapped = true;
+            }
+
+            // Clock requests (10 10 / 80 10), the 26 26 poll, clock frames
+            // (0D 0D), and bare heartbeats (0C 0C with no records) are all
+            // understood -- they must not clutter the mapping queue.
+            if ((n >= 12 && ((v[10] == 0x10 && v[11] == 0x10) ||
+                             (v[10] == 0x80 && v[11] == 0x10) ||
+                             (v[10] == 0x26 && v[11] == 0x26))) ||
+                (v[3] == 0x21 && n >= 12 && v[10] == 0x0D && v[11] == 0x0D) ||
+                (v[3] == 0x21 && n <= 13 && v[10] == 0x0C && v[11] == 0x0C))
+              mapped = true;
+
+            // COMMAND frames: payload header 0A 0A. Same records as reports.
+            if (v[3] == 0x21 && n >= 15 && v[10] == 0x0A && v[11] == 0x0A) {
+              std::string cmd; size_t w = 13;
+              while (w + 1 < n) {
+                uint8_t fid = v[w]; bool wide = false;
+                if (fid == 0x02 || fid == 0x03 || fid == 0x5C || fid == 0x60 ||
+                    fid == 0x64 || fid == 0x65 || fid == 0x72 || fid == 0xC0 ||
+                    fid == 0x95 || fid == 0xBD || fid == 0xBE || fid == 0xBF)
+                  wide = (w + 4 < n && v[w+1] == 0x00 && v[w+2] == 0x00);
+                char t[32];
+                if (wide) {
+                  sprintf(t, "%02X=%u ", fid, (unsigned)(((uint16_t)v[w+3] << 8) | v[w+4]));
+                  w += 6;
+                } else {
+                  sprintf(t, "%02X=%02X ", fid, v[w+1]);
+                  w += 3;
+                }
+                if (cmd.size() < 240) cmd += t;
+              }
+              if (!cmd.empty() && cmd != prev_cmd) { prev_cmd = cmd; id(last_command).publish_state(cmd); }
+              mapped = true;
+            }
+
+            std::string unmapped;
+            // ---- state report: payload header 0C 0C ----
+            if (v[3] == 0x21 && n >= 15 && v[10] == 0x0C && v[11] == 0x0C) {
+              mapped = true;
+
+              // Wide fields <id> 00 00 <hi> <lo>. Every record is a multiple
+              // of three bytes, so stride 3 stays on real boundaries.
+              if (n >= 18) {
+                for (size_t w = 13; w + 4 < n; w += 3) {
+                  if (v[w+1] != 0x00 || v[w+2] != 0x00) continue;
+                  uint16_t val = ((uint16_t) v[w+3] << 8) | v[w+4];
+                  switch (v[w]) {
+                    case 0x00:                                // misalignment
+                    case 0x01: case 0x05: case 0x0C: case 0x0D:   // narrow
+                    case 0x0E: case 0x11: case 0x12: case 0x13:
+                    case 0x73: case 0xDF: case 0x2D:
+                    case 0x38: case 0x39:                     // length-prefixed
+                    case 0x02: case 0x03: case 0x5C:
+                    case 0x60: case 0x64: case 0x65: case 0x72: case 0xC0:
+                    case 0x95: case 0xBD: case 0xBE: case 0xBF:
+                      break;                                  // known -- not surfaced twice
+                    default:
+                      // Unknown wide: surface in a plausible thermistor band.
+                      if (val >= 200 && val <= 5000) {
+                        char t[48];
+                        sprintf(t, "%02X=%u(%.1fF)(w) ", v[w], (unsigned) val,
+                                val / 100.0f * 9.0f / 5.0f + 32.0f);
+                        if (unmapped.size() < 230) unmapped += t;
+                      }
+                      break;
+                  }
+                  switch (v[w]) {
+                    case 0x02:  // setpoint, centi-degrees C
+                      if (val >= 100 && val <= 6500) id(setpoint_c).publish_state(val / 100.0f);
+                      break;
+                    case 0x03:  // room temperature, centi-degrees C
+                      if (val >= 500 && val <= 5000) {
+                        id(room_temp_f).publish_state(val / 100.0f * 9.0f / 5.0f + 32.0f);
+                        id(ac_climate).set_room_temperature_f(val / 100.0f * 9.0f / 5.0f + 32.0f);
+                      }
+                      break;
+                    case 0x60:  // outdoor temperature, centi-degrees C
+                      if (val <= 6500) id(outdoor_temp_f).publish_state(val / 100.0f * 9.0f / 5.0f + 32.0f);
+                      break;
+                    case 0x65:  // actual compressor speed, percent
+                      if (val <= 100) {
+                        id(compressor_actual_pct).publish_state((float) val);
+                        id(ac_climate).set_compressor_running(val > 0);
+                      }
+                      break;
+                    case 0xC0:  // commanded compressor target, percent
+                      if (val <= 200) id(compressor_target_pct).publish_state((float) val);
+                      break;
+                    case 0x64:  // input power, watts
+                      if (val <= 5000) id(input_power_w).publish_state((float) val);
+                      break;
+                    case 0x72:  // fan percent
+                      if (val <= 100) id(fan_pct).publish_state((float) val);
+                      break;
+                  }
+                }
+              }
+
+              // Main record walk. Records are <id> <val> with the byte before
+              // each id being a NAMESPACE selector (00 plain / 02 parameter),
+              // and the LAST record has no trailing separator.
+              size_t w = 13;
+              while (w + 1 < n) {
+                uint8_t fid = v[w], val = v[w+1];
+
+                // Wide fields: skip the whole 6-byte record.
+                if ((fid == 0x02 || fid == 0x03 || fid == 0x5C || fid == 0x64 ||
+                     fid == 0xC0 || fid == 0x60 || fid == 0x65 || fid == 0x72) &&
+                    w + 4 < n && v[w+1] == 0x00 && v[w+2] == 0x00) { w += 6; continue; }
+
+                // Unidentified wide group: skip, but surface the real 16-bit value.
+                if ((fid == 0x95 || fid == 0xBD || fid == 0xBE || fid == 0xBF) &&
+                    w + 4 < n && v[w+1] == 0x00 && v[w+2] == 0x00) {
+                  char t[24];
+                  sprintf(t, "%02X=%u(w) ", fid, (unsigned)(((uint16_t)v[w+3] << 8) | v[w+4]));
+                  if (unmapped.size() < 230) unmapped += t;
+                  w += 6; continue;
+                }
+
+                // Namespace 0x02 = parameter records with their own widths.
+                {
+                  uint8_t ns = (w >= 1) ? v[w-1] : 0x00;
+                  if (ns == 0x02) {
+                    int wdt;
+                    switch (fid) {
+                      case 0x21: case 0x22: case 0x27: case 0x64: wdt = 4; break;
+                      case 0x24: case 0x25:                       wdt = 1; break;
+                      default:                                    wdt = -1; break;
+                    }
+                    if (wdt > 0 && w + 1 + (size_t) wdt <= n) {
+                      w += 1 + (size_t) wdt + 1;   // id + data + next ns byte
+                      continue;
+                    }
+                  }
+                }
+
+                // 0x38 / 0x39 are length-prefixed lists, not normal records.
+                if ((fid == 0x39 || fid == 0x38) && w + 1 < n) {
+                  uint8_t len = v[w+1];
+                  if (w + 2 + (size_t) len <= n) { w += (size_t) len + 3; continue; }
+                }
+
+                w += 3;
+                switch (fid) {
+                  case 0x01:   // power -- toggled exactly in step with power presses
+                    id(power).publish_state(val != 0);
+                    id(ac_power_sw).publish_state(val != 0);   // keep the command switch honest
+                    id(ac_climate).set_power_state(val != 0);
+                    break;
+                  case 0x05:   // fan speed, 7 steps + auto
+                    if (val <= 15) {
+                      id(fan_speed).publish_state((float) val);
+                      id(ac_climate).set_fan_state((int) val, val == 0);
+                    }
+                    break;
+                  case 0x12: { // mode: 0 auto 1 cool 2 dry 3 fan 4 heat
+                    if (val <= 4) {
+                      static const char *const NAMES[5] = {"auto", "cool", "dry", "fan", "heat"};
+                      id(mode_name).publish_state(NAMES[val]);
+                      id(ac_mode_sel).publish_state(std::string(NAMES[val]));
+                      id(ac_climate).set_mode_raw((int) val);
+                    }
+                    break;
+                  }
+                  // Known ids without an entity in this lean build: louver axes,
+                  // eco, beep, health, drying, sleep, companions.
+                  case 0x0C: case 0x0D: case 0x0E: case 0x11: case 0x13:
+                  case 0x15: case 0x22: case 0x25: case 0x27:
+                  case 0x2D: case 0xDF: case 0x0A:
+                    break;
+                  case 0x73:   // FAN AUTO flag -- auto is flag 1 + speed 0, every
+                               // manual speed is flag 0 + the speed. Feed climate
+                               // with the speed the node currently knows (the
+                               // report may carry 05 before or after 73).
+                    id(ac_climate).set_fan_state(id(fan_speed).has_state() ? (int) id(fan_speed).state : 0, val != 0);
+                    break;
+                  case 0x1E:   // Display Light -- the indoor unit's LED display.
+                               // K18W capture confirmed the app toggle 1E=00 then
+                               // 1E=01. Mirror reports into the switch so it
+                               // self-corrects (e.g. toggled by the handheld).
+                    id(ac_light_sw).publish_state(val != 0);
+                    break;
+                  default: {
+                    char t[16];
+                    sprintf(t, "%02X=%02X ", fid, val);
+                    if (unmapped.size() < 230) unmapped += t;
+                    break;
+                  }
+                }
+              }
+
+              // Setpoint: frames end `02 27 00 00 00 <degF>` -- the parameter
+              // sits after the record list, so it is matched as a signature.
+              if (n >= 16 && v[n-6] == 0x02 && v[n-5] == 0x27 && v[n-4] == 0x00 &&
+                  v[n-3] == 0x00 && v[n-2] == 0x00) {
+                uint8_t sp = v[n-1];
+                if (sp >= 55 && sp <= 95) {
+                  id(setpoint_f).publish_state((float) sp);
+                  id(ac_set_sp).publish_state((float) sp);      // track the unit, don't lie about it
+                  id(ac_climate).set_setpoint_f((float) sp);
+                }
+              }
+
+              if (!unmapped.empty()) {
+                if (unmapped != prev_unmapped) {
+                  prev_unmapped = unmapped;
+                  id(unmapped_fields).publish_state(unmapped.size() > 250 ? unmapped.substr(0, 250) : unmapped);
+                }
+              } else if (prev_unmapped != "all-mapped") {
+                prev_unmapped = "all-mapped";
+                id(unmapped_fields).publish_state("all-mapped");
+              }
+            } else if (!mapped) {
+              // Unrecognised frame shape: the hex IS the mapping material.
+              char pre[24];
+              sprintf(pre, "shape %02X/%02X ", v[3], (n >= 12 ? v[10] : 0x00));
+              std::string u = std::string(pre) + hex;
+              if (u.size() > 250) u = u.substr(0, 250);
+              if (u != prev_unmapped) {
+                prev_unmapped = u;
+                id(unmapped_fields).publish_state(u);
+              }
+            }
+
+            // =================================================================
+            // SESSION 2 TX -- gated by the "TX Armed" switch (default OFF, so a
+            // fresh flash is the pure session-1 listener until armed). Once
+            // armed we drive the bus exactly two ways:
+            //   * ACK every verified report (type 0x21) with a 0x23 echo.
+            //   * answer clock requests (payload header 10 10 / 80 10) with the
+            //     ACiQ-verified 0x23 answer: A5 01 00 23 .. 80 10 <unix BE32> FB.
+            // SAFE: a malformed ACK/clock is simply ignored by the mainboard
+            // (bad CRC or unrecognized layout) -> it keeps doing what it was
+            // doing; nothing here can change setpoint/mode/fan (that is
+            // session 2b, built from the real QIO command frames in
+            // `Last Command`). No per-frame logging (the ACiQ RX-wedge lesson).
+            if (id(g_tx_armed)) {
+              bool clock_req = (v[3] == 0x21 && n >= 12 &&
+                                ((v[10] == 0x10 && v[11] == 0x10) ||
+                                 (v[10] == 0x80 && v[11] == 0x10)));
+              if (clock_req) {
+                if (id(g_clock_enabled)) {
+                  auto dt = id(ac_time).now();
+                  if (dt.year >= 2020) {   // NTP actually synced, not epoch
+                    uint32_t ts = (uint32_t) dt.timestamp;
+                    uint8_t g[17];
+                    // Mirrors aciq_tx.h clock_reply() byte-for-byte (verified capture):
+                    //   A5 01 00 23 00 00 00 11 <crc16-hi> <crc16-lo> 80 10 <unix BE32> FB
+                    g[0]=0xA5; g[1]=0x01; g[2]=0x00; g[3]=0x23;
+                    g[4]=0x00; g[5]=0x00; g[6]=0x00; g[7]=17;
+                    g[8]=0; g[9]=0;
+                    g[10]=0x80; g[11]=0x10;  // ACiQ-verified clock-answer header
+                    g[12]=(uint8_t)(ts>>24); g[13]=(uint8_t)(ts>>16);
+                    g[14]=(uint8_t)(ts>>8);  g[15]=(uint8_t)(ts&0xFF);
+                    g[16]=0xFB;              // ACiQ-verified trailer
+                    uint16_t c=0x0000;
+                    for (int k=0;k<17;k++) { if (k==8||k==9) continue;   // hole CRC, same as RX
+                      c ^= (uint16_t) g[k] << 8;
+                      for (int j=0;j<8;j++) c = (c & 0x8000) ? (uint16_t)((c<<1)^0x1021) : (uint16_t)(c<<1); }
+                    g[8]=(uint8_t)(c>>8); g[9]=(uint8_t)(c&0xFF);
+                    id(ac_bus).write_array(g, 17);
+                    id(g_clocks_sent)++;
+                  }
+                }
+              } else if (id(g_ack_enabled) && v[3] == 0x21) {
+                // ACK mirroring ACiQ's observed layout:
+                //   A5 01 <link> 23 00 <counter> 00 0C 24 4E 80 0C
+                uint8_t f[12];
+                f[0]=0xA5; f[1]=0x01; f[2]=v[2]; f[3]=0x23;
+                f[4]=0x00; f[5]=v[4];   // ACiQ: the echoed counter lands at byte [5].
+                                        // If the bus does not calm, swap to f[4]=v[4], f[5]=0x00.
+                f[6]=0x00; f[7]=12; f[8]=0; f[9]=0;
+                f[10]=0x80; f[11]=0x0C; // payload mirrored from ACiQ's ACK (field-verify)
+                uint16_t c=0x0000;
+                for (int k=0;k<12;k++) { if (k==8||k==9) continue;   // hole CRC, same as RX
+                  c ^= (uint16_t) f[k] << 8;
+                  for (int j=0;j<8;j++) c = (c & 0x8000) ? (uint16_t)((c<<1)^0x1021) : (uint16_t)(c<<1); }
+                f[8]=(uint8_t)(c>>8); f[9]=(uint8_t)(c&0xFF);
+                id(ac_bus).write_array(f, 12);
+                id(g_acks_sent)++;
+              }
+            }
+
+            n = 0;   // next frame
+          }
+
+  # ---- deaf-tap watchdog (ported from ACiQ, who needed it twice in one day)
+  # A wedged UART RX FIFO is the likely failure mode and a reboot is a free
+  # fix. Triggers on RAW-BYTE silence (frames are bursty; bytes are not):
+  # 2 min deaf -> reboot, max 3 times, then log and stop (mains-off case).
+  - interval: 30s
+    then:
+      - lambda: |-
+          static const char *const TAG = "ac-lsn";
+          const uint32_t DEAF_MS  = 2 * 60 * 1000UL;
+          const uint32_t GRACE_MS = 10 * 60 * 1000UL;   // first frame took 7.5 min once
+          const uint8_t  MAX_TRIES = 3;
+
+          uint32_t up = millis();
+          if (up < GRACE_MS) return;                    // post-boot grace
+
+          uint32_t last = id(last_byte_ms);
+          bool deaf = (last == 0) || (up - last > DEAF_MS);
+
+          if (!deaf) {
+            uint32_t lastf = id(last_frame_ms);
+            if (lastf != 0 && up - lastf > 10 * 60 * 1000UL) {
+              ESP_LOGW(TAG, "bytes arriving but nothing framed for %u min -- "
+                            "suspect CRC/alignment or baud rate, NOT the receiver",
+                       (unsigned) ((up - lastf) / 60000UL));
+            }
+            return;
+          }
+
+          if (id(wd_reboots) >= MAX_TRIES) {
+            ESP_LOGW(TAG, "WATCHDOG: still deaf after %u restarts -- giving up. "
+                          "Check AC power, tap wiring, and common GND.", (unsigned) id(wd_reboots));
+            return;
+          }
+          id(wd_reboots) = id(wd_reboots) + 1;
+          ESP_LOGW(TAG, "WATCHDOG: tap deaf %u s -- restart %u of %u",
+                   (unsigned) (last == 0 ? up / 1000UL : (up - last) / 1000UL),
+                   (unsigned) id(wd_reboots), (unsigned) MAX_TRIES);
+          App.safe_reboot();
+
+# =============================================================================
+# SESSION 2b -- COMMANDS (absolute; one HA action = one frame on the wire)
+#
+# Frame construction is aciq_tx.h (pulled in via `esphome: includes`): the
+# same header/length/CRC/records code ACiQ verified against real-dongle
+# captures. Every shape below was re-verified byte-for-byte against those
+# captures before it went in.
+#
+# Interlock: every path funnels through the tx_send script, which refuses to
+# touch the wire unless TX Armed is ON. Disarmed, a control action logs why
+# and sends nothing -- same behaviour as the session-1 listener.
+#
+# State authority stays with the AC's own reports: the decoder mirrors them
+# into these entities (setpoint/power/mode), so a command that the mainboard
+# rejects simply does not move the entity on the next report.
+# =============================================================================
+
+script:
+  # The ONLY place commands touch the wire.
+  - id: tx_send
+    parameters:
+      frame: std::vector<uint8_t>
+    then:
+      - lambda: |-
+          if (!id(g_tx_armed)) {
+            ESP_LOGW("ac-cmd", "command suppressed (%u bytes) -- TX not armed. "
+                               "Arm 'TX Armed' with Tuya UNPLUGGED, then retry.",
+                     (unsigned) frame.size());
+            return;
+          }
+          id(ac_bus).write_array(frame.data(), frame.size());
+          id(g_cmds_sent)++;
+          std::string hex; char t[4];
+          for (uint8_t b : frame) { sprintf(t, "%02X ", b); hex += t; }
+          if (!hex.empty()) hex.pop_back();
+          ESP_LOGI("ac-cmd", "TX %s", hex.c_str());
+
+number:
+  # ABSOLUTE setpoint -- never reads prior state, works right after a reboot.
+  # Sends BOTH records the app sends (verified on the wire 2026-08-13):
+  #   wide field 0x02 = centi-Celsius, ladder 2700 + (degF-81)*50 clamped to
+  #     this unit's own advertised limits (params 0x21/0x22 = 1600..3100, which
+  #     is exactly the 59..89 F ladder) -- so label and value always agree.
+  #   parameter  0x27 = the degF display label.
+  # Sending one without the other leaves the unit and its display disagreeing.
+  - platform: template
+    name: "Set Setpoint"
+    id: ac_set_sp
+    icon: mdi:thermometer
+    unit_of_measurement: "\u00B0F"
+    min_value: 59
+    max_value: 89
+    step: 1
+    mode: box
+    optimistic: true
+    entity_category: config
+    set_action:
+      - lambda: |-
+          int f = (int) lroundf(x);
+          if (f < 59) f = 59;
+          if (f > 89) f = 89;
+          auto c = aciq::Command(id(g_tx_seq)++);
+          c.wide(0x02, aciq::centi_c_for_degf(f)).param(0x27, (uint8_t) f);
+          id(tx_send)->execute(c.build());
+
+select:
+  # Mode: field 0x12 = 0 auto / 1 cool / 2 dry / 3 fan / 4 heat -- values
+  # verified on the K18W by pressing each mode in the app and reading the
+  # command frame it produced. NOTE (K18W behaviour): switching to dry also
+  # forces a fan speed (the app sends 05=02 together with 12=02) -- watch the
+  # Fan Speed sensor after selecting dry.
+  - platform: template
+    name: "Set Mode"
+    id: ac_mode_sel
+    icon: mdi:hvac
+    optimistic: true
+    options: ["auto", "cool", "dry", "fan", "heat"]
+    entity_category: config
+    on_value:
+      - lambda: |-
+          int m = 0;
+          for (int k = 0; k < 5; k++) {
+            static const char *const N[5] = {"auto", "cool", "dry", "fan", "heat"};
+            if (x == N[k]) { m = k; break; }
+          }
+          auto c = aciq::Command(id(g_tx_seq)++);
+          c.field(0x12, (uint8_t) m);
+          id(tx_send)->execute(c.build());
+
+  # Fan: 0x73 is the AUTO FLAG, not a speed. Auto = flag 1 + speed 0; every
+  # manual speed = flag 0 + the speed ("mute" is speed 1 on this family).
+  # Treating auto as "speed 0" alone does not work.
+  - platform: template
+    name: "Set Fan"
+    id: ac_fan_sel
+    icon: mdi:fan
+    optimistic: true
+    options: ["auto", "mute", "2", "3", "4", "5", "6", "7"]
+    entity_category: config
+    on_value:
+      - lambda: |-
+          uint8_t speed = 0, autoflag = 0;
+          if (x == "auto")      { autoflag = 1; speed = 0; }
+          else if (x == "mute") { speed = 1; }
+          else                  { speed = (uint8_t) atoi(x.c_str()); }
+          auto c = aciq::Command(id(g_tx_seq)++);
+          c.field(0x73, autoflag).field(0x05, speed);
+          id(tx_send)->execute(c.build());
+
+switch:
+  # Master gate for ALL transmission. Defaults OFF and does not restore, so a
+  # fresh flash is the pure session-1 listener until you deliberately arm TX.
+  # ARM ONLY WITH TUYA UNPLUGGED (we replace it; two drivers on one wire = contention).
+  - platform: template
+    name: "TX Armed"
+    id: tx_armed
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      lambda: |-
+        id(g_tx_armed) = true;
+        ESP_LOGI("ac-ctl", "TX ARMED -- node now drives the bus (ACK + clock). Tuya must be UNPLUGGED.");
+    turn_off_action:
+      lambda: |-
+        id(g_tx_armed) = false;
+        ESP_LOGI("ac-ctl", "TX DISARMED -- pure listener again.");
+
+  # Absolute power command: field 0x01 = 1 on / 0 off. Needs no prior state,
+  # so it works immediately after a reboot. The "Power" binary sensor is what
+  # the UNIT reports; this switch is what WE commanded (the decoder mirrors
+  # reports into it, so it self-corrects -- e.g. unit turned off by timer).
+  - platform: template
+    name: "AC Power"
+    id: ac_power_sw
+    icon: mdi:power-plug
+    optimistic: true
+    entity_category: config
+    turn_on_action:
+      lambda: |-
+        auto c = aciq::Command(id(g_tx_seq)++);
+        c.field(0x01, 0x01);
+        id(tx_send)->execute(c.build());
+    turn_off_action:
+      lambda: |-
+        auto c = aciq::Command(id(g_tx_seq)++);
+        c.field(0x01, 0x00);
+        id(tx_send)->execute(c.build());
+
+  # Eco mode: field 0x13 (captured on the K18W: `00 13 01` for on; the AC
+  # echoes it back in its next state report, which is how it was confirmed).
+  - platform: template
+    name: "Eco Mode"
+    id: ac_eco_sw
+    icon: mdi:leaf
+    optimistic: true
+    entity_category: config
+    turn_on_action:
+      lambda: |-
+        auto c = aciq::Command(id(g_tx_seq)++);
+        c.field(0x13, 0x01);
+        id(tx_send)->execute(c.build());
+    turn_off_action:
+      lambda: |-
+        auto c = aciq::Command(id(g_tx_seq)++);
+        c.field(0x13, 0x00);
+        id(tx_send)->execute(c.build());
+
+  # Display Light: field 0x1E -- the indoor unit's LED display (the app's
+  # "Light" toggle; K18W capture confirmed command shape `1E=00` then `1E=01`).
+  # The decoder mirrors the unit's reports into this switch, so it self-corrects
+  # like AC Power does (e.g. someone toggles it on the handheld).
+  - platform: template
+    name: "Display Light"
+    id: ac_light_sw
+    icon: mdi:led-on
+    optimistic: true
+    entity_category: config
+    turn_on_action:
+      lambda: |-
+        auto c = aciq::Command(id(g_tx_seq)++);
+        c.field(0x1E, 0x01);
+        id(tx_send)->execute(c.build());
+    turn_off_action:
+      lambda: |-
+        auto c = aciq::Command(id(g_tx_seq)++);
+        c.field(0x1E, 0x00);
+        id(tx_send)->execute(c.build());
+
+# =============================================================================
+# CLIMATE ENTITY (ACiQ's verified external component -- see components/ above)
+#
+# The HA-facing surface. It owns NO uart: state is pushed in from the decoder
+# above via set_*(), and control requests come back out as triggers so the
+# frame is still built with aciq_tx.h and sent through `tx_send` -- the same
+# TX-Armed interlock and single wire path as every other command. A climate
+# component with its own private route to the wire would bypass both.
+#
+# Nothing here publishes optimistic state. The AC reports what it actually did
+# a moment later, and that report is the authority -- so a setpoint the
+# mainboard range-checks out simply does not stick, exactly like the raw
+# entities already behave.
+#
+# UNITS: the ESPHome climate API is Celsius-only (HA converts for display).
+# control() rounds the requested value to a whole degF -- the unit's ladder and
+# its own display are built on degF (59..89 here, from the unit's own
+# 0x21/0x22 = 1600..3100 centi-C) -- so the card offers 1-degree steps in
+# whatever display unit HA is set to.
+# =============================================================================
+climate:
+  - platform: aciq_k18w
+    id: ac_climate
+    name: "Mini-Split"
+
+    # Mode. `x` is the raw protocol value, or -1 for power off.
+    on_set_mode:
+      - lambda: |-
+          if (x < 0) {
+            auto off = aciq::Command(id(g_tx_seq)++);
+            off.field(0x01, 0x00);
+            id(tx_send)->execute(off.build());
+            return;
+          }
+          auto c = aciq::Command(id(g_tx_seq)++);
+          // Power on in the SAME frame when HA picks a mode while the unit is
+          // off. Multi-record commands are the unit's own idiom, and 0x01 is
+          // absolute -- setting it on an already-on unit is a no-op. Also
+          // covers power being unknown right after a node reboot.
+          if (!id(power).has_state() || !id(power).state) c.field(0x01, 0x01);
+          c.field(0x12, (uint8_t) x);
+          id(tx_send)->execute(c.build());
+
+    # Setpoint. `x` is Fahrenheit, already rounded whole in control().
+    on_set_temperature:
+      - lambda: |-
+          int f = (int) lroundf(x);
+          if (f < 59) f = 59;
+          if (f > 89) f = 89;
+          // Both records, as the app sends: centi-Celsius value + degF label.
+          // One without the other leaves the unit and its display disagreeing.
+          auto c = aciq::Command(id(g_tx_seq)++);
+          c.wide(0x02, aciq::centi_c_for_degf(f)).param(0x27, (uint8_t) f);
+          id(tx_send)->execute(c.build());
+
+    # Fan. `x` is 0 for auto, 1 for mute, 2..7 for the manual speeds.
+    on_set_fan:
+      - lambda: |-
+          uint8_t speed = (uint8_t) x, autoflag = 0;
+          if (x <= 0) { autoflag = 1; speed = 0; }
+          // 0x73 is the AUTO FLAG, not a speed. Auto is flag=1 with speed 0.
+          auto c = aciq::Command(id(g_tx_seq)++);
+          c.field(0x73, autoflag).field(0x05, speed);
+          id(tx_send)->execute(c.build());
+
+button:
+  # Bounce the tap from Home Assistant instead of walking to it.
+  - platform: restart
+    name: "Restart"
+    entity_category: diagnostic
