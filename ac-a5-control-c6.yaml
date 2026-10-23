@@ -718,10 +718,10 @@ interval:
                     break;
                   }
                   // Known ids without a report-side entity in this lean build:
-                  // louver axes (0x11 has the command-side probe select below),
-                  // eco, beep, health, drying, sleep, companions.
+                  // louver axes (probe selects for 0x0E h / 0x11 v below),
+                  // health, drying, sleep, companions.
                   case 0x0C: case 0x0D: case 0x0E: case 0x11: case 0x13:
-                  case 0x15: case 0x22: case 0x25: case 0x27:
+                  case 0x15: case 0x22: case 0x27:
                   case 0x2D: case 0xDF: case 0x0A:
                     break;
                   case 0x73:   // FAN AUTO flag -- auto is flag 1 + speed 0, every
@@ -748,6 +748,11 @@ interval:
                                // 1E=01. Mirror reports into the switch so it
                                // self-corrects (e.g. toggled by the handheld).
                     id(ac_light_sw).publish_state(val != 0);
+                    break;
+                  case 0x25:   // Beep -- reminder/confirmation tone toggle.
+                               // Mirror reports into the switch if the unit
+                               // echoes the setting back.
+                    id(ac_beep_sw).publish_state(val != 0);
                     break;
                   default: {
                     char t[16];
@@ -1025,6 +1030,24 @@ select:
           c.field(0x11, (uint8_t) v);
           id(tx_send)->execute(c.build());
 
+  # H-louver probe: field 0x0E -- same deal as the vertical one above, other
+  # axis. If it ACKs but nothing moves, also try it with the unit in a
+  # different mode before calling it unsupported.
+  - platform: template
+    name: "H-Louver Probe"
+    id: h_louver_probe
+    icon: mdi:arrow-left-right
+    optimistic: true
+    options: ["0", "1", "2", "3", "4", "5", "6", "7", "8"]
+    entity_category: config
+    on_value:
+      - lambda: |-
+          int v = atoi(x.c_str());
+          if (v < 0 || v > 255) return;
+          auto c = aciq::Command(id(g_tx_seq)++);
+          c.field(0x0E, (uint8_t) v);
+          id(tx_send)->execute(c.build());
+
 switch:
   # Master gate for ALL transmission. Defaults OFF and does not restore, so a
   # fresh flash is the pure session-1 listener until you deliberately arm TX.
@@ -1103,6 +1126,27 @@ switch:
       lambda: |-
         auto c = aciq::Command(id(g_tx_seq)++);
         c.field(0x1E, 0x00);
+        id(tx_send)->execute(c.build());
+
+  # Beep: field 0x25 -- the unit's reminder/confirmation tone (the app's "Beep"
+  # setting). On/off per the family map; first use confirms via ACK + an
+  # audible beep. The decoder mirrors reports into this switch, so it
+  # self-corrects like Display Light does.
+  - platform: template
+    name: "Beep"
+    id: ac_beep_sw
+    icon: mdi:bell
+    optimistic: true
+    entity_category: config
+    turn_on_action:
+      lambda: |-
+        auto c = aciq::Command(id(g_tx_seq)++);
+        c.field(0x25, 0x01);
+        id(tx_send)->execute(c.build());
+    turn_off_action:
+      lambda: |-
+        auto c = aciq::Command(id(g_tx_seq)++);
+        c.field(0x25, 0x00);
         id(tx_send)->execute(c.build());
 
 # =============================================================================
