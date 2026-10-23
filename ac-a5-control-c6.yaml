@@ -147,12 +147,12 @@ time:
 
 uart:
   id: ac_bus
-  rx_pin: D4               # GPIO22, plain GPIO (I2C-SDA by default) -- moved off D7/GPIO17
+  rx_pin: D6               # GPIO22, plain GPIO (I2C-SDA by default) -- moved off D7/GPIO17
                            # (UART0 console RX) for the permanent install so D6/D7 are free.
                            # Shifter path unchanged: green wire -> B1 -> A1 (VERIFIED this unit's
                            # traffic is on that side). Flipped from D5 2026-10-21: first build had
                            # RX/TX backwards, node was deaf.
-  tx_pin: D5               # GPIO23, plain GPIO (I2C-SCL by default) -- moved off D6/GPIO16
+  tx_pin: D7               # GPIO23, plain GPIO (I2C-SCL by default) -- moved off D6/GPIO16
                            # (UART0 console TX) for the permanent install. Shifter path unchanged:
                            # red wire (module->mainboard data) -> B2 -> A2.
                            # Driven only while "TX Armed" is ON. If "ACKs Sent" climbs but the
