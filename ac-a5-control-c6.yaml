@@ -718,14 +718,15 @@ interval:
                                // with the speed the node currently knows (the
                                // report may carry 05 before or after 73).
                     {
-                      int sp = id(fan_speed).has_state() ? (int) id(fan_speed).state : 0;
+                      // uint8_t (not int) so GCC can prove the snprintf below can't truncate.
+                      uint8_t sp = id(fan_speed).has_state() ? (uint8_t) id(fan_speed).state : 0;
                       if (val != 0 || sp <= 0) {
                         id(ac_climate).set_fan_mode(climate::CLIMATE_FAN_AUTO);
                       } else if (sp == 1) {
                         id(ac_climate).set_custom_fan_mode("mute");
                       } else {
                         char b[8];
-                        snprintf(b, sizeof b, "%d", sp);
+                        snprintf(b, sizeof b, "%u", (unsigned) sp);
                         id(ac_climate).set_custom_fan_mode(b);
                       }
                       id(ac_climate).publish_state();
