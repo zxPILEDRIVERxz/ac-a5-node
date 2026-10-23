@@ -120,6 +120,12 @@ logger:
   # NOTE: never log per-frame. ACiQ's node went deaf in 5-38 min with
   # ESP_LOGI on every frame and ran 9.4 h clean after removing it. This build
   # has zero per-frame logging; the Last Frame entity carries the same hex.
+  # baud_rate 0 = no serial console at all. The AC bus lives on D6/D7, which
+  # ARE this chip's UART0 TX/RX pins (see uart: below) -- a serial logger
+  # would fight the bus for those pins and leak log bytes onto the wire.
+  # All observability is HA entities; if you ever want logs, use USB-C:
+  # hardware_uart: USB_CDC (and drop this line).
+  baud_rate: 0
 
 api:
 
@@ -147,16 +153,20 @@ time:
 
 uart:
   id: ac_bus
-  rx_pin: D6               # GPIO22, plain GPIO (I2C-SDA by default) -- moved off D7/GPIO17
-                           # (UART0 console RX) for the permanent install so D6/D7 are free.
-                           # Shifter path unchanged: green wire -> B1 -> A1 (VERIFIED this unit's
-                           # traffic is on that side). Flipped from D5 2026-10-21: first build had
-                           # RX/TX backwards, node was deaf.
-  tx_pin: D7               # GPIO23, plain GPIO (I2C-SCL by default) -- moved off D6/GPIO16
-                           # (UART0 console TX) for the permanent install. Shifter path unchanged:
-                           # red wire (module->mainboard data) -> B2 -> A2.
-                           # Driven only while "TX Armed" is ON. If "ACKs Sent" climbs but the
-                           # bus does not calm down, we are on the wrong data wire -- swap it.
+  # XIAO ESP32C6 pin facts (board pinout): D4=GPIO22 (I2C SDA), D5=GPIO23 (SCL),
+  # D6=GPIO16 = UART0 TXD, D7=GPIO17 = UART0 RXD.
+  rx_pin: D6               # GPIO16 -- green wire -> B1 -> A1 (mainboard->module data;
+                           # VERIFIED this unit's traffic is on that side). Pinned here
+                           # 2026-10-23 for shortest routing on the current board. This IS
+                           # the chip's console TX pin, so the logger runs baud_rate: 0
+                           # (above) -- do not re-enable serial logging without moving the
+                           # bus pins.
+  tx_pin: D7               # GPIO17 -- red wire -> B2 -> A2 (module->mainboard data).
+                           # Driven only while "TX Armed" is ON. If "ACKs Sent" climbs but
+                           # the unit ignores commands, RX/TX are crossed again -- swap them
+                           # (the first build was backwards and deaf; that bite is permanent).
+                           # Pin history: D7/D6 (2026-10-20 metered map) -> D4/D5 (2026-10-21,
+                           # "permanent install") -> D6/D7 (2026-10-23, routing).
   baud_rate: 115200        # ACiQ measured 115200 empirically (2347/2347 pulses).
                            # If raw bytes rise but frames never do, try 9600.
   data_bits: 8
@@ -707,7 +717,8 @@ interval:
                     }
                     break;
                   }
-                  // Known ids without an entity in this lean build: louver axes,
+                  // Known ids without a report-side entity in this lean build:
+                  // louver axes (0x11 has the command-side probe select below),
                   // eco, beep, health, drying, sleep, companions.
                   case 0x0C: case 0x0D: case 0x0E: case 0x11: case 0x13:
                   case 0x15: case 0x22: case 0x25: case 0x27:
@@ -989,6 +1000,29 @@ select:
           else                  { speed = (uint8_t) atoi(x.c_str()); }
           auto c = aciq::Command(id(g_tx_seq)++);
           c.field(0x73, autoflag).field(0x05, speed);
+          id(tx_send)->execute(c.build());
+
+  # V-louver / SWING PROBE: field 0x11 (id verified in ACiQ captures of this
+  # family; value semantics unknown on this unit). Step through the options
+  # with TX Armed ON and Tuya unplugged, watching three things: the vane,
+  # "Commands ACKed" (mainboard accepts the field), and "Unmapped Fields"
+  # (if the unit starts reporting louver state back, it lands there and the
+  # real value set reveals itself for free). Once values are characterized,
+  # replace this with a proper tracking entity. Horizontal louver = 0x0E,
+  # same treatment when/if wanted.
+  - platform: template
+    name: "V-Louver Probe"
+    id: v_louver_probe
+    icon: mdi:arrow-up-down
+    optimistic: true
+    options: ["0", "1", "2", "3", "4", "5", "6", "7", "8"]
+    entity_category: config
+    on_value:
+      - lambda: |-
+          int v = atoi(x.c_str());
+          if (v < 0 || v > 255) return;
+          auto c = aciq::Command(id(g_tx_seq)++);
+          c.field(0x11, (uint8_t) v);
           id(tx_send)->execute(c.build());
 
 switch:
