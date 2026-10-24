@@ -85,9 +85,9 @@
 #                       Moves only when you touch a control entity.
 #   Commands ACKed      mainboard 0x23 frames carrying payload header 80 0A =
 #                       it accepted one of OUR commands. The closed-loop proof:
-#                       change Set Setpoint, watch this tick, then watch the
-#                       Setpoint (C field) / Setpoint (F param) sensors move to
-#                       the new value in the next report (~17 s).
+#                       change the climate setpoint, watch this tick, then
+#                       watch the Setpoint (C field) / Setpoint (F param)
+#                       sensors move to the new value in the next report (~17 s).
 #   Unmapped Fields     fields not yet named = your mapping queue. When it
 #                       reads "all-mapped" every field in the frame is known.
 #   Power / Mode / ...  publish as soon as those known fields appear, so you
@@ -703,7 +703,6 @@ interval:
                     if (val <= 4) {
                       static const char *const NAMES[5] = {"auto", "cool", "dry", "fan", "heat"};
                       id(mode_name).publish_state(NAMES[val]);
-                      id(ac_mode_sel).publish_state(std::string(NAMES[val]));
                       // The unit's "auto" is the HA-facing heat/cool mode.
                       static const climate::ClimateMode MAP[5] = {
                           climate::CLIMATE_MODE_HEAT_COOL, climate::CLIMATE_MODE_COOL,
@@ -781,7 +780,6 @@ interval:
                 uint8_t sp = v[n-1];
                 if (sp >= 55 && sp <= 95) {
                   id(setpoint_f).publish_state((float) sp);
-                  id(ac_set_sp).publish_state((float) sp);      // track the unit, don't lie about it
                   id(ac_climate).target_temperature = (sp - 32.0f) * 5.0f / 9.0f;  // C-only API
                   id(ac_climate).publish_state();
                 }
@@ -946,78 +944,7 @@ script:
           if (!hex.empty()) hex.pop_back();
           ESP_LOGI("ac-cmd", "TX %s", hex.c_str());
 
-number:
-  # ABSOLUTE setpoint -- never reads prior state, works right after a reboot.
-  # Sends BOTH records the app sends (verified on the wire 2026-08-13):
-  #   wide field 0x02 = centi-Celsius, ladder 2700 + (degF-81)*50 clamped to
-  #     this unit's own advertised limits (params 0x21/0x22 = 1600..3100, which
-  #     is exactly the 59..89 F ladder) -- so label and value always agree.
-  #   parameter  0x27 = the degF display label.
-  # Sending one without the other leaves the unit and its display disagreeing.
-  - platform: template
-    name: "Set Setpoint"
-    id: ac_set_sp
-    icon: mdi:thermometer
-    unit_of_measurement: "\u00B0F"
-    min_value: 59
-    max_value: 89
-    step: 1
-    mode: box
-    optimistic: true
-    entity_category: config
-    set_action:
-      - lambda: |-
-          int f = (int) lroundf(x);
-          if (f < 59) f = 59;
-          if (f > 89) f = 89;
-          auto c = aciq::Command(id(g_tx_seq)++);
-          c.wide(0x02, aciq::centi_c_for_degf(f)).param(0x27, (uint8_t) f);
-          id(tx_send)->execute(c.build());
-
 select:
-  # Mode: field 0x12 = 0 auto / 1 cool / 2 dry / 3 fan / 4 heat -- values
-  # verified on the K18W by pressing each mode in the app and reading the
-  # command frame it produced. NOTE (K18W behaviour): switching to dry also
-  # forces a fan speed (the app sends 05=02 together with 12=02) -- watch the
-  # Fan Speed sensor after selecting dry.
-  - platform: template
-    name: "Set Mode"
-    id: ac_mode_sel
-    icon: mdi:hvac
-    optimistic: true
-    options: ["auto", "cool", "dry", "fan", "heat"]
-    entity_category: config
-    on_value:
-      - lambda: |-
-          int m = 0;
-          for (int k = 0; k < 5; k++) {
-            static const char *const N[5] = {"auto", "cool", "dry", "fan", "heat"};
-            if (x == N[k]) { m = k; break; }
-          }
-          auto c = aciq::Command(id(g_tx_seq)++);
-          c.field(0x12, (uint8_t) m);
-          id(tx_send)->execute(c.build());
-
-  # Fan: 0x73 is the AUTO FLAG, not a speed. Auto = flag 1 + speed 0; every
-  # manual speed = flag 0 + the speed ("mute" is speed 1 on this family).
-  # Treating auto as "speed 0" alone does not work.
-  - platform: template
-    name: "Set Fan"
-    id: ac_fan_sel
-    icon: mdi:fan
-    optimistic: true
-    options: ["auto", "mute", "2", "3", "4", "5", "6", "7"]
-    entity_category: config
-    on_value:
-      - lambda: |-
-          uint8_t speed = 0, autoflag = 0;
-          if (x == "auto")      { autoflag = 1; speed = 0; }
-          else if (x == "mute") { speed = 1; }
-          else                  { speed = (uint8_t) atoi(x.c_str()); }
-          auto c = aciq::Command(id(g_tx_seq)++);
-          c.field(0x73, autoflag).field(0x05, speed);
-          id(tx_send)->execute(c.build());
-
   # V-louver / SWING PROBE: field 0x11 (id verified in ACiQ captures of this
   # family; value semantics unknown on this unit). Step through the options
   # with TX Armed ON and Tuya unplugged, watching three things: the vane,
@@ -1218,6 +1145,8 @@ climate:
       fan_mode: AUTO
 
     # Mode. `x` is the requested ClimateMode; OFF sends the power-off frame.
+    # (K18W wire note: the app pairs dry with a fan record 05=02; we send the
+    # bare mode and the unit adjusts its own fan.)
     set_mode_action:
       - lambda: |-
           int raw = -1;
