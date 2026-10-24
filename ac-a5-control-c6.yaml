@@ -677,16 +677,12 @@ interval:
 
                 w += 3;
                 switch (fid) {
-                  case 0x01:   // power -- toggled exactly in step with power presses
+                  case 0x01:   // power -- toggled exactly in step with power presses.
+                               // The card's Off bookkeeping happens once, after the
+                               // field loop (below), so it wins no matter where 0x01
+                               // sits among the other fields in the frame.
                     id(power).publish_state(val != 0);
                     id(ac_power_sw).publish_state(val != 0);   // keep the command switch honest
-                    if (val == 0) {
-                      // Power off wins over whatever mode the unit last reported -- the AC
-                      // keeps reporting `cool` while switched off.
-                      id(ac_climate).set_mode(climate::CLIMATE_MODE_OFF);
-                      id(ac_climate).action = climate::CLIMATE_ACTION_OFF;
-                    }
-                    id(ac_climate).publish_state();
                     break;
                   case 0x05:   // fan speed, 7 steps + auto
                     if (val <= 15) {
@@ -765,6 +761,17 @@ interval:
                     break;
                   }
                 }
+              }
+
+              // Power off wins over whatever mode/fan the unit keeps reporting -- it
+              // sends its last mode (`cool`) even while switched off, and 0x12 can sit
+              // AFTER 0x01 in a frame, so this runs after the field loop: the card shows
+              // Off no matter which control turned the unit off (climate Off, the AC
+              // Power switch, or the handheld).
+              if (id(power).has_state() && !id(power).state) {
+                id(ac_climate).set_mode(climate::CLIMATE_MODE_OFF);
+                id(ac_climate).action = climate::CLIMATE_ACTION_OFF;
+                id(ac_climate).publish_state();
               }
 
               // Setpoint: frames end `02 27 00 00 00 <degF>` -- the parameter
