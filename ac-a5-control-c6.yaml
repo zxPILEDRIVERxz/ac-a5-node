@@ -718,10 +718,13 @@ interval:
                     }
                     break;
                   }
-                  // Known ids without a report-side entity in this lean build:
-                  // louver axes (probe selects for 0x0E h / 0x11 v below),
-                  // health, drying, sleep, companions.
-                  case 0x0C: case 0x0D: case 0x0E: case 0x11: case 0x13:
+                  // Known ids without a report-side entity in this lean build.
+                  // 0x0E/0x11 (louver axes) are deliberately NOT ignored while
+                  // the probes are being mapped: if the unit reports its louver
+                  // positions at all, they surface here as "0E=xx" / "11=yy" in
+                  // Unmapped Fields. They get a proper case (and leave this list)
+                  // when the final entities land.
+                  case 0x0C: case 0x0D: case 0x13:
                   case 0x15: case 0x22: case 0x27:
                   case 0x2D: case 0xDF: case 0x0A:
                     break;
