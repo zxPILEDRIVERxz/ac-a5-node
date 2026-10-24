@@ -1064,7 +1064,7 @@ switch:
     id: tx_armed
     entity_category: config
     optimistic: true
-    restore_mode: RESTORE
+    restore_mode: RESTORE_DEFAULT_OFF
     turn_on_action:
       lambda: |-
         id(g_tx_armed) = true;
