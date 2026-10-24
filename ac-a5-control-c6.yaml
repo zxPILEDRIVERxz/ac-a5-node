@@ -10,9 +10,10 @@
 #           a tx_pin and ACiQ-verified command frames (session 2b).
 #
 # *** SAFETY MODEL (read before arming TX) ***
-#   * "TX Armed" (switch in HA) defaults OFF and does not restore. A fresh
-#     flash behaves EXACTLY like the session-1 listener until you arm it, so
-#     first flash is zero-risk even if Tuya happens to be plugged in.
+#   * "TX Armed" (switch in HA) restores its last state across reboots/OTA,
+#     so normal ops stay armed and pushes from HA just work. A FRESH flash has
+#     no stored state and boots disarmed -- exactly the session-1 listener until
+#     you arm it, so a first flash is zero-risk even if Tuya is plugged in.
 #   * Arm TX only with Tuya UNPLUGGED -- our node REPLACES it; two modules
 #     driving one wire at once is push-pull contention. Keep TX disarmed and
 #     plug Tuya in ONLY to capture `Last Command` frames passively.
@@ -798,8 +799,8 @@ interval:
             }
 
             // =================================================================
-            // SESSION 2 TX -- gated by the "TX Armed" switch (default OFF, so a
-            // fresh flash is the pure session-1 listener until armed). Once
+            // SESSION 2 TX -- gated by the "TX Armed" switch (restores its last
+            // state; a fresh flash boots disarmed = pure session-1 listener). Once
             // armed we drive the bus exactly two ways:
             //   * ACK every verified report (type 0x21) with a 0x23 echo.
             //   * answer clock requests (payload header 10 10 / 80 10) with the
@@ -1049,15 +1050,21 @@ select:
           id(tx_send)->execute(c.build());
 
 switch:
-  # Master gate for ALL transmission. Defaults OFF and does not restore, so a
-  # fresh flash is the pure session-1 listener until you deliberately arm TX.
-  # ARM ONLY WITH TUYA UNPLUGGED (we replace it; two drivers on one wire = contention).
+  # Master gate for ALL transmission. Restores its last state across reboots/OTA,
+  # so normal ops stay armed and pushes from HA just work. A fresh flash has no
+  # stored state -> boots disarmed (pure session-1 listener); arm it once. KEEP
+  # THIS SWITCH: disarm before plugging the Tuya dongle back in (capture sessions,
+  # dongle debugging) and leave it disarmed while the dongle is in the loop -- two
+  # drivers on the module->mainboard wire fight through the shifter: frame
+  # corruption at best, out-of-spec drive into a C6 GPIO at worst (same failure
+  # class as the D+ incident). A manual disarm survives reboots too, so it holds
+  # for the whole Tuya session.
   - platform: template
     name: "TX Armed"
     id: tx_armed
     entity_category: config
     optimistic: true
-    restore_mode: ALWAYS_OFF
+    restore_mode: RESTORE
     turn_on_action:
       lambda: |-
         id(g_tx_armed) = true;
@@ -1159,10 +1166,12 @@ switch:
 # same TX-Armed interlock and single wire path as every other command. A
 # climate platform with its own private route to the wire would bypass both.
 #
-# optimistic: false -- nothing here publishes on a command. The AC reports what
-# it actually did a moment later, and that report is the authority -- so a
-# setpoint the mainboard range-checks out simply does not stick, exactly like
-# the raw entities already behave.
+# optimistic: true -- every push (mode / setpoint / fan) publishes state
+# immediately, so the card behaves like any other climate entity in HA. The
+# unit's own report is still the authority and arrives on its next periodic
+# state report (a few seconds to ~20 s while we ACK): the decoder above then
+# overwrites whatever we asked for with what the unit actually did, so a
+# setpoint the mainboard range-checks out simply does not stick.
 #
 # UNITS: the ESPHome climate API is Celsius-only (HA converts for display).
 # set_target_temperature_action rounds the request to a whole degF -- the unit's
@@ -1187,7 +1196,7 @@ climate:
     supported_fan_modes:
       - AUTO
     custom_fan_modes: [mute, "2", "3", "4", "5", "6", "7"]
-    optimistic: false
+    optimistic: true
     visual:
       min_temperature: 16.0
       max_temperature: 31.0
