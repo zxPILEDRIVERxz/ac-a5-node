@@ -156,13 +156,13 @@ uart:
   id: ac_bus
   # XIAO ESP32C6 pin facts (board pinout): D4=GPIO22 (I2C SDA), D5=GPIO23 (SCL),
   # D6=GPIO16 = UART0 TXD, D7=GPIO17 = UART0 RXD.
-  rx_pin: D6               # GPIO16 -- green wire -> B1 -> A1 (mainboard->module data;
+  rx_pin: D10               # GPIO16 -- green wire -> B1 -> A1 (mainboard->module data;
                            # VERIFIED this unit's traffic is on that side). Pinned here
                            # 2026-10-23 for shortest routing on the current board. This IS
                            # the chip's console TX pin, so the logger runs baud_rate: 0
                            # (above) -- do not re-enable serial logging without moving the
                            # bus pins.
-  tx_pin: D7               # GPIO17 -- red wire -> B2 -> A2 (module->mainboard data).
+  tx_pin: D9               # GPIO17 -- red wire -> B2 -> A2 (module->mainboard data).
                            # Driven only while "TX Armed" is ON. If "ACKs Sent" climbs but
                            # the unit ignores commands, RX/TX are crossed again -- swap them
                            # (the first build was backwards and deaf; that bite is permanent).
