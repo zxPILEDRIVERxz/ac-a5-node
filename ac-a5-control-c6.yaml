@@ -583,22 +583,22 @@ interval:
                       break;
                   }
                   switch (v[w]) {
-                    case 0x02:  // setpoint, centi-degrees C (a degree-F HA instance
-                                // converts the display; the wire value really is C)
-                      if (val >= 100 && val <= 6500) {
-                        id(setpoint_c).publish_state(val / 100.0f);
+                    case 0x02:  // setpoint, on the unit's degF ladder (wide =
+                                // 50*degF - 1400 -- NOT centi-Celsius; aciq_tx.h)
+                      if (val >= 1600 && val <= 3100) {
+                        id(setpoint_c).publish_state(aciq::degc_for_wide(val));
                         // Also mirror into the climate entity: each rotation report
                         // carries only ONE field, and the 0x27 tail signature appears
                         // in only a few report shapes -- so this is usually the only
                         // live source of the card's setpoint/slider.
-                        id(ac_climate).target_temperature = val / 100.0f;   // C-only API
+                        id(ac_climate).target_temperature = aciq::degc_for_wide(val);   // C-only API
                         id(ac_climate).publish_state();
                       }
                       break;
-                    case 0x03:  // room temperature, centi-degrees C
-                      if (val >= 500 && val <= 5000) {
-                        id(room_temp_f).publish_state(val / 100.0f * 9.0f / 5.0f + 32.0f);
-                        id(room_temp_c).publish_state(val / 100.0f);   // climate's current temp (C-only API)
+                    case 0x03:  // room temperature, same degF ladder as the setpoint
+                      if (val >= 1000 && val <= 4500) {
+                        id(room_temp_f).publish_state((float) aciq::degf_for_wide(val));
+                        id(room_temp_c).publish_state(aciq::degc_for_wide(val));   // climate's current temp (C-only API)
                       }
                       break;
                     case 0x60:  // outdoor temperature, centi-degrees C
@@ -1121,9 +1121,9 @@ switch:
 #
 # UNITS: the ESPHome climate API is Celsius-only (HA converts for display).
 # set_target_temperature_action rounds the request to a whole degF -- the unit's
-# ladder and its own display are built on degF (59..89 here, from the unit's
-# own 0x21/0x22 = 1600..3100 centi-C). The card offers 1-degree steps in
-# whatever display unit HA is set to.
+# ladder and its own display are built on degF (60..90 here, from the unit's own
+# limits 0x21/0x22 = 1600..3100 on the degF ladder, wide = 50*degF - 1400). The
+# card offers whole-degree steps in whatever display unit HA is set to.
 # =============================================================================
 climate:
   - platform: template
@@ -1144,8 +1144,8 @@ climate:
     custom_fan_modes: [mute, "2", "3", "4", "5", "6", "7"]
     optimistic: true
     visual:
-      min_temperature: 16.0
-      max_temperature: 31.0
+      min_temperature: 15.6
+      max_temperature: 32.2
       temperature_step:
         target_temperature: 1.0
         current_temperature: 0.5
@@ -1187,12 +1187,12 @@ climate:
     set_target_temperature_action:
       - lambda: |-
           int f = (int) lroundf(x * 9.0f / 5.0f + 32.0f);
-          if (f < 59) f = 59;
-          if (f > 89) f = 89;
-          // Both records, as the app sends: centi-Celsius value + degF label.
+          if (f < 60) f = 60;
+          if (f > 90) f = 90;
+          // Both records, as the app sends: degF-ladder wide value + degF label.
           // One without the other leaves the unit and its display disagreeing.
           auto c = aciq::Command(id(g_tx_seq)++);
-          c.wide(0x02, aciq::centi_c_for_degf(f)).param(0x27, (uint8_t) f);
+          c.wide(0x02, aciq::wide_for_degf(f)).param(0x27, (uint8_t) f);
           id(tx_send)->execute(c.build());
 
     # Fan (built-in enum). Only AUTO is offered here; mute and the manual

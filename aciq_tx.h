@@ -116,9 +116,11 @@ class Command {
     return *this;
   }
 
-  // Wide field: <00> <id> 00 00 <hi> <lo>. Setpoint (0x02) is centi-CELSIUS
-  // and moves in 50-count steps -- a plain degF->degC conversion lands between
-  // steps and the unit rounds it somewhere you did not ask for.
+  // Wide field: <00> <id> 00 00 <hi> <lo>. Temperature fields (setpoint 0x02,
+  // room temp 0x03) ride the unit's degF ladder -- 50 counts per whole degree F
+  // (wide = 50*degF - 1400; see wide_for_degf / degc_for_wide below). Do NOT read
+  // the raw value as centi-Celsius: it is not, and a plain conversion lands
+  // between ladder steps.
   Command &wide(uint8_t id, uint16_t value) {
     f_.push_back(0x00);
     f_.push_back(id);
@@ -150,15 +152,30 @@ class Command {
   std::vector<uint8_t> f_;
 };
 
-// Setpoint conversion, from the observed ladder:
-//   81 F -> 2700    80 F -> 2650    79 F -> 2600
-// i.e. 50 centi-degrees per Fahrenheit step, anchored at 81 F = 2700.
-// Clamped to the unit's own advertised limits (params 0x21/0x22 = 1600/3100).
-inline uint16_t centi_c_for_degf(int degf) {
-  int v = 2700 + (degf - 81) * 50;
+// Setpoint conversion, the unit's degF ladder -- confirmed 2026-10-28 from live
+// frames: the handheld set 66 F shows wide 1900, the unit's own limits (params
+// 0x21/0x22 = 1600/3100) fall on exactly 60 / 90 F, and a slider push to "79"
+// sent wide 2600, which the unit decoded as 80 F. So wide = 50*degF - 1400:
+//   81 F -> 2650    80 F -> 2600    79 F -> 2550
+// An earlier build anchored one ladder step high (81 F = 2700), which made every
+// push land a degree hot. Clamped to the unit's advertised limits (1600/3100).
+inline uint16_t wide_for_degf(int degf) {
+  int v = 2650 + (degf - 81) * 50;
   if (v < 1600) v = 1600;
   if (v > 3100) v = 3100;
   return (uint16_t) v;
+}
+
+// Inverse of the ladder, for the report side. The AC reports its temperatures on
+// this same degF ladder, so a wide field recovers to whole degrees F first; the
+// climate API is Celsius-only, hence the second form. Both feed the decoder's
+// 0x02 (setpoint) and 0x03 (room temp) mirrors.
+inline int degf_for_wide(uint16_t wide) {
+  return (int) ((wide + 1400) / 50);      // whole degrees F on the ladder
+}
+
+inline float degc_for_wide(uint16_t wide) {
+  return (degf_for_wide(wide) - 32) * 5.0f / 9.0f;
 }
 
 }  // namespace aciq
