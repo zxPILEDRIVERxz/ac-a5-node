@@ -1,0 +1,6 @@
+{
+  "name": "aciq_tx",
+  "version": "1.0.0",
+  "description": "A5 IR-bus frame builder + CRC16 for the ac-a5-listen ESPHome node (header-only)",
+  "headers": ["aciq_tx.h"]
+}
