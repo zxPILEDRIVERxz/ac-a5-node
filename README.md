@@ -21,9 +21,14 @@ Both push paths build on the ESPHome build-server pod (ns `esphome`, dir `/confi
 
 1. **Dashboard (primary):** LAN-only, no auth — `http://192.168.0.222` (cluster LB
    into the esphome service; device-builder dashboard). It reads pod `/config` directly.
-2. **HA ESPHome app:** uploads a tarball of its *stored project* from
-   `/config/esphome/` on the HA host (192.168.0.117) into the pod. Its stored
-   copy must be kept in sync with this repo (flat files only — no subdirs).
+2. **HA ESPHome app:** bundles its *stored project* (flat files under
+   `/config/esphome/` on the HA host, 192.168.0.117) into a tarball and ships
+   it to the pod for compilation. The stored `aciq_tx.h` must be
+   byte-identical with this repo's: `esphome: includes:` resolves **only**
+   against the project root, so a stale stored copy silently shadows the
+   git-fetched one (verified in ESPHome 2026.10 `bundle.py`:
+   `_resolve_include_path` -> `CORE.relative_config_path`). A stale header
+   means the build compiles with the old frame code — verify before flashing.
 
 Sync this repo to the pod (run from a box with the cluster kubeconfig):
 
@@ -34,6 +39,16 @@ Sync this repo to the pod (run from a box with the cluster kubeconfig):
 (`secrets.yaml` is already on the pod, dashboard-managed.)
 
 The pod's `/config` has its own git; commit there after syncing.
+
+Sync `aciq_tx.h` to the HA host (run there) whenever this repo's header
+changes — the config yaml needs no sync, the wrapper re-pulls it from this
+repo on every build (the wrapper *file itself* is the exception: if you edit
+it, update the stored copy too):
+
+    curl -fsSL -H "Authorization: token <GITHUB_TOKEN>" \
+      https://raw.githubusercontent.com/zxPILEDRIVERxz/ac-a5-node/main/aciq_tx.h \
+      -o /config/esphome/aciq_tx.h
+    md5sum /config/esphome/aciq_tx.h   # must match this repo's copy
 
 ## Constraints (do not break)
 
