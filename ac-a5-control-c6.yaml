@@ -103,10 +103,19 @@
 esphome:
   name: ac-a5-listen          # name unchanged on purpose: OTA from the existing HA device entry
   friendly_name: "AC Bus Control (XIAO C6)"
-  # Session 2b frame construction (CRC, length, records). Header-only, next to
-  # this file. Verified against real-dongle captures in PROTOCOL.md.
+  # Session 2b frame construction (CRC, length, records). The header is fetched
+  # from THIS repo at build time as a git library (see libraries: below) -- no
+  # flat aciq_tx.h copy exists in any project dir. Angle-bracket include form:
+  # resolved via the library's include path (repo root), not the project dir.
+  # Verified against real-dongle captures in PROTOCOL.md.
   includes:
-    - aciq_tx.h
+    - <aciq_tx.h>
+  libraries:
+    # Pinned to the last commit that touched aciq_tx.h/library.json. The fragment
+    # is the ONLY freshness lever (the library clone cache never refreshes), so
+    # after any header change bump it in a follow-up commit -- README, "Keeping
+    # the header fresh".
+    - aciq_tx=https://github.com/zxPILEDRIVERxz/ac-a5-node#7141285e093a15bf817d6452ada00a50399cea69
 
 # CLIMATE PLATFORM: built-in Template Climate (esphome >= 2026.9) -- no custom
 # component needed. It owns no UART: the decoder above pushes state into it,
@@ -138,11 +147,14 @@ ota:
 mdns:
 
 wifi:
-  ssid: ChewysHouse
+  ssid: !secret wifi_ssid
   password: !secret wifi_password
   ap:
     ssid: "ac-a5-listen fallback"
-    password: "changeme1234"
+    # PSK is a secret (repo is public). It was the "changeme1234" placeholder
+    # until 2026-10-28 and is a generated value now; to rotate it, change the
+    # wifi_ap_password secret on BOTH sides (pod /config and HA project secrets).
+    password: !secret wifi_ap_password
 
 captive_portal:
 

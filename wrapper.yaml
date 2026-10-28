@@ -4,8 +4,8 @@
 packages:
   ac_node:
     url: https://github.com/zxPILEDRIVERxz/ac-a5-node
-    username: zxPILEDRIVERxz
-    password: !secret ac_a5_listen__github_token
+    # Public repo: no auth. (The header is fetched separately as an ESPHome
+    # library by the config itself -- see ac-a5-control-c6.yaml, libraries:.)
     files: [ac-a5-control-c6.yaml]
     # Default package cache is 1 day -- that would let a push build with
     # yesterday's config. Always re-fetch so every build is the repo HEAD.
