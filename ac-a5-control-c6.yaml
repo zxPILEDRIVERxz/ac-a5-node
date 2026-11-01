@@ -143,20 +143,29 @@ ota:
   - platform: esphome
 
 # Lets the build server + HA discover the node by name (ac-a5-listen.local)
-# for OTA, instead of hunting its IP. Safe/standard; no cloud involvement.
+# for OTA, instead of hunting its IP. On Thread the SRP client publishes the
+# service and the HA Yellow's border router re-advertises it over mDNS --
+# same discovery flow, new transport. Safe/standard; no cloud involvement.
 mdns:
 
-wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-  ap:
-    ssid: "ac-a5-listen fallback"
-    # PSK is a secret (repo is public). It was the "changeme1234" placeholder
-    # until 2026-10-28 and is a generated value now; to rotate it, change the
-    # wifi_ap_password secret on BOTH sides (pod /config and HA project secrets).
-    password: !secret wifi_ap_password
+# THREAD BACKHAUL (2026-11-01) -- replaces wifi: entirely. openthread and
+# wifi CONFLICT on one C6 (coexistence is not implemented), so this build
+# has NO wifi stack at all: Thread is the only transport, no fallback AP.
+# Recovery from a bad flash = USB-C + last known-good build. The dataset
+# TLV comes from the HA Yellow's border router (HA "Thread" panel ->
+# "Active dataset TLVs") and lives ONLY as `tlv` in secrets.yaml (pod
+# /config + chart seed). It keys the whole Thread network -- treat it like
+# the old wifi password; it never goes in this repo. (captive_portal: went
+# with wifi -- the component DEPENDS on it.)
+network:
+  enable_ipv6: true
 
-captive_portal:
+openthread:
+  device_type: FTD     # mains-powered -> Thread may promote it to a router,
+                        # extending the mesh for sleepy (MTD) devices
+  tlv: !secret tlv
+  force_dataset: true  # always apply THIS dataset at boot -- matters after
+                        # any future OTA that carries an updated TLV
 
 time:
   - platform: sntp
