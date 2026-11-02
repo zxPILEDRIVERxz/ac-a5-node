@@ -466,6 +466,12 @@ text_sensor:
     id: unmapped_fields
     entity_category: diagnostic
 
+  - platform: openthread_info
+    role:
+      name: "Thread Role"
+    rloc16:
+      name: "Thread RLOC16"
+
 interval:
   # ---- the decoder: runs every 10 ms, drains the UART, frames, checksums,
   #      and decodes. Ported from ACiQ's proven 9.4-hour-stable config: same
